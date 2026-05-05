@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+pydantic
+requests
+transformers==4.40.0
+sentence-transformers
+soxr

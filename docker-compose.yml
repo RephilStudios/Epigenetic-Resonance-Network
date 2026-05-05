@@ -1,0 +1,18 @@
+services:
+  ern-agent:
+    build: .
+    container_name: ern-agent-api
+    # Share the host's network stack so the container can reach
+    # Ollama at localhost:11434 directly without routing issues
+    network_mode: host
+    volumes:
+      - ./ern_state:/app/ern_state
+    environment:
+      - OLLAMA_URL=http://localhost:11434/api/chat
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0']
+              capabilities: [gpu]

@@ -55,6 +55,7 @@ class ChatRequest(BaseModel):
     history: List[Message] = []
     focus_threshold: float = 0.15
     agentic_search: bool = True
+    temporal_discovery: bool = True
     pipeline: Optional[List[str]] = None
     auto_route: bool = False
     active_expert: Optional[str] = None
@@ -68,6 +69,7 @@ class ChatResponse(BaseModel):
 class MemoryStoreRequest(BaseModel):
     text: str
     tags: str = ""
+    memory_type: Optional[str] = None
 
 class ModuleConfig(BaseModel):
     module_id: str
@@ -296,12 +298,13 @@ class ERNModule:
     def _now(self) -> float:
         return time.time()
 
-    def encode_hebbian(self, text: str, tags: str, image_url: Optional[str] = None) -> str:
+    def encode_hebbian(self, text: str, tags: str, image_url: Optional[str] = None, memory_type: str = "fact") -> str:
         memory_id = str(uuid.uuid4())
         self.vault[memory_id] = {
             "text": text,
             "tags": tags,
-            "timestamp": self._now()
+            "timestamp": self._now(),
+            "memory_type": memory_type
         }
         if image_url:
             self.vault[memory_id]["image_url"] = image_url
@@ -311,8 +314,20 @@ class ERNModule:
 
         prev_size = self.memory_bank.size(0)
         self.memory_bank = torch.cat([self.memory_bank, vec], dim=0)
-        self.energies    = torch.cat([self.energies, torch.tensor([0.5], device=self.device)])
-        self.short_term_energies = torch.cat([self.short_term_energies, torch.tensor([2.0], device=self.device)])
+
+        # Determine initial energies based on memory_type
+        if memory_type == "question":
+            init_energy = 0.2
+            init_stp = 1.0
+        elif memory_type == "instruction":
+            init_energy = 1.0
+            init_stp = 3.0
+        else: # "fact" or other
+            init_energy = 0.5
+            init_stp = 2.0
+
+        self.energies    = torch.cat([self.energies, torch.tensor([init_energy], device=self.device)])
+        self.short_term_energies = torch.cat([self.short_term_energies, torch.tensor([init_stp], device=self.device)])
         self.labels.append(memory_id)
 
         self.deltas.push(TensorDelta(
@@ -322,12 +337,12 @@ class ERNModule:
             prev_size  = prev_size,
             next_size  = self.memory_bank.size(0),
             new_vec    = vec.cpu().clone(),
-            new_energy = 0.5,
+            new_energy = init_energy,
             memory_id  = memory_id,
         ))
 
         self._save_state()
-        print(f"[ERN][{self.name}] Synapse formed. Network size: {self.memory_bank.size(0)} nodes.")
+        print(f"[ERN][{self.name}] Synapse formed. Type: {memory_type}. Network size: {self.memory_bank.size(0)} nodes.")
         return memory_id
 
     def decay_energies(self):
@@ -877,11 +892,15 @@ def run_memory_judge(user_message: str, prior_memories: str = "", target_module_
             if not fact_match:
                 continue
             fact = fact_match.group(1).strip().replace("\n", " ")
-            tags = tags_match.group(1).strip() if tags_match else "General, Importance: Medium"
+            inferred_tags, memory_type = _classify_message(fact)
+            if tags_match:
+                tags = f"{tags_match.group(1).strip()}, {inferred_tags}"
+            else:
+                tags = inferred_tags
             if not fact or len(fact) < 5:
                 continue
-            print(f"[MEMORY JUDGE] Saving fact to '{target_mod.name}': {fact[:100]}")
-            target_mod.encode_hebbian(text=fact, tags=tags)
+            print(f"[MEMORY JUDGE] Saving fact to '{target_mod.name}': {fact[:100]} | type: {memory_type}")
+            target_mod.encode_hebbian(text=fact, tags=tags, memory_type=memory_type)
             saved_count += 1
 
         if saved_count > 0:
@@ -889,9 +908,12 @@ def run_memory_judge(user_message: str, prior_memories: str = "", target_module_
         else:
             # FALLBACK: LLM returned garbage we couldn't parse — save the raw message
             print(f"[MEMORY JUDGE] Parser found 0 facts from LLM output. Saving raw message as fallback.")
+            tags, memory_type = _classify_message(user_message)
+            tags = f"User Message, Auto-Captured, {tags}"
             target_mod.encode_hebbian(
                 text=user_message[:500],
-                tags="User Message, Auto-Captured, Importance: Medium"
+                tags=tags,
+                memory_type=memory_type
             )
 
     except Exception as e:
@@ -900,9 +922,12 @@ def run_memory_judge(user_message: str, prior_memories: str = "", target_module_
         try:
             if target_mod:
                 print(f"[MEMORY JUDGE] Exception fallback — saving raw message to '{target_mod.name}'.")
+                tags, memory_type = _classify_message(user_message)
+                tags = f"User Message, Exception-Fallback, {tags}"
                 target_mod.encode_hebbian(
                     text=user_message[:500],
-                    tags="User Message, Exception-Fallback, Importance: Medium"
+                    tags=tags,
+                    memory_type=memory_type
                 )
         except Exception as e2:
             print(f"[MEMORY JUDGE] FATAL fallback failed too: {e2}")
@@ -1120,8 +1145,8 @@ def process_image_background(image_bytes: bytes, filename: str, image_url: Optio
 # 5. Endpoints
 # ==========================================
 
-def _heuristic_tags(text: str) -> str:
-    """Generate meaningful tags from message text using fast keyword heuristics."""
+def _classify_message(text: str) -> tuple[str, str]:
+    """Generate meaningful tags and determine memory type from message text using fast keyword heuristics."""
     t = text.lower()
     tags = []
 
@@ -1133,12 +1158,16 @@ def _heuristic_tags(text: str) -> str:
 
     if is_question:
         tags.append("Question")
+        memory_type = "question"
     elif is_instruction:
         tags.append("Instruction")
+        memory_type = "instruction"
     elif is_personal:
         tags.append("Personal Statement")
+        memory_type = "fact"
     else:
         tags.append("Statement")
+        memory_type = "fact"
 
     # ── Topic categories ──────────────────────────────────────────────────────
     topic_map = {
@@ -1179,7 +1208,7 @@ def _heuristic_tags(text: str) -> str:
         importance = "Importance: Medium"
 
     tags.append(importance)
-    return ", ".join(tags)
+    return ", ".join(tags), memory_type
 
 
 def _direct_save_message(user_message: str, target_module_id: str) -> None:
@@ -1197,11 +1226,119 @@ def _direct_save_message(user_message: str, target_module_id: str) -> None:
         if not mod:
             print(f"[DIRECT SAVE] ERROR: Could not resolve module '{target_module_id}'")
             return
-        tags = _heuristic_tags(stripped)
-        mem_id = mod.encode_hebbian(text=stripped[:500], tags=tags)
-        print(f"[DIRECT SAVE] ✓ Saved to '{mod.name}' | tags: {tags} | id={mem_id}")
+        tags, memory_type = _classify_message(stripped)
+        mem_id = mod.encode_hebbian(text=stripped[:500], tags=tags, memory_type=memory_type)
+        print(f"[DIRECT SAVE] ✓ Saved to '{mod.name}' | tags: {tags} | type: {memory_type} | id={mem_id}")
     except Exception as e:
         print(f"[DIRECT SAVE] EXCEPTION: {e}")
+
+def _format_age(seconds: float) -> str:
+    if seconds < 0:
+        seconds = 0
+    if seconds < 60:
+        return "just now"
+    minutes = seconds / 60
+    if minutes < 60:
+        return f"{int(minutes)}m ago"
+    hours = minutes / 60
+    if hours < 24:
+        mins_left = int(minutes % 60)
+        return f"{int(hours)}h {mins_left}m ago"
+    days = hours / 24
+    hours_left = int(hours % 24)
+    return f"{int(days)}d {hours_left}h ago"
+
+
+def format_temporal_memory_block(unique_memories: List[Dict[str, Any]], now: float, temporal_discovery: bool) -> str:
+    if not unique_memories:
+        return "No relevant memories retrieved."
+
+    enriched = []
+    for m in unique_memories:
+        pid = m["module_id"]
+        mod = manager.get_module(pid)
+        vault_entry = mod.vault.get(m["memory_id"]) if mod else None
+        
+        ts = vault_entry.get("timestamp") if vault_entry else None
+        if not ts:
+            ts = now
+            
+        mtype = vault_entry.get("memory_type") if vault_entry else None
+        if not mtype:
+            _, mtype = _classify_message(vault_entry.get("text", "") if vault_entry else m["text"])
+            
+        img = vault_entry.get("image_url") if vault_entry else None
+        
+        age_sec = now - ts
+        age_str = _format_age(age_sec)
+        formatted_date = datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+        
+        m_enriched = dict(m)
+        m_enriched["memory_type"] = mtype
+        m_enriched["age_seconds"] = age_sec
+        m_enriched["age_human"] = age_str
+        m_enriched["formatted_date"] = formatted_date
+        m_enriched["image_url"] = img
+        enriched.append(m_enriched)
+
+    # Chronological sort: oldest first (largest age_seconds is oldest, so sort descending by age_seconds)
+    enriched.sort(key=lambda x: x["age_seconds"], reverse=True)
+
+    instructions = [x for x in enriched if x["memory_type"] == "instruction"]
+    facts = [x for x in enriched if x["memory_type"] == "fact"]
+    questions = [x for x in enriched if x["memory_type"] == "question"]
+
+    lines = []
+    
+    if temporal_discovery:
+        lines.append("[ERN SUBCONSCIOUS RECALL — TEMPORALLY ORDERED TIMELINE]")
+        lines.append(f"Timeline Anchor: NOW = {datetime.datetime.fromtimestamp(now).strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append("")
+    else:
+        lines.append("[ERN SUBCONSCIOUS RECALL]")
+        lines.append("")
+
+    if instructions:
+        lines.append("## SYSTEM DIRECTIVES & PERSISTENT INSTRUCTIONS:")
+        for idx, m in enumerate(instructions, 1):
+            time_info = f" [{m['age_human']} | {m['formatted_date']}]" if temporal_discovery else ""
+            img_info = f"\n  * Image Archive Path: {m['image_url']}" if m.get("image_url") else ""
+            lines.append(
+                f"- INSTRUCTION {idx} [Expert Module: {m['module_name']}]{time_info}:\n"
+                f"  * Content: {m['text']}\n"
+                f"  * Tags/Metadata: {m['tags']}"
+                f"{img_info}"
+            )
+        lines.append("")
+
+    if facts:
+        lines.append("## RECALLED CHRONOLOGICAL TIMELINE (FACTS & STATEMENTS):")
+        for idx, m in enumerate(facts, 1):
+            time_info = f" [{m['age_human']} | {m['formatted_date']}]" if temporal_discovery else ""
+            img_info = f"\n  * Image Archive Path: {m['image_url']}" if m.get("image_url") else ""
+            lines.append(
+                f"- FACT {idx} [Expert Module: {m['module_name']}]{time_info}:\n"
+                f"  * Content: {m['text']}\n"
+                f"  * Tags/Metadata: {m['tags']}"
+                f"{img_info}"
+            )
+        lines.append("")
+
+    if questions:
+        lines.append("## PAST USER QUESTIONS & CURIOSITIES (DO NOT TREAT AS ESTABLISHED FACTS):")
+        for idx, m in enumerate(questions, 1):
+            time_info = f" [{m['age_human']} | {m['formatted_date']}]" if temporal_discovery else ""
+            img_info = f"\n  * Image Archive Path: {m['image_url']}" if m.get("image_url") else ""
+            lines.append(
+                f"- PAST QUESTION {idx} [Expert Module: {m['module_name']}]{time_info}:\n"
+                f"  * Question Content: {m['text']}\n"
+                f"  * Tags/Metadata: {m['tags']}"
+                f"{img_info}"
+            )
+        lines.append("")
+
+    return "\n".join(lines).strip()
+
 
 @app.post("/api/chat", response_model=ChatResponse)
 def process_chat(req: ChatRequest, background_tasks: BackgroundTasks):
@@ -1364,29 +1501,36 @@ def process_chat(req: ChatRequest, background_tasks: BackgroundTasks):
         "detail": "Background memory extractor queued to parse raw turn text for new facts."
     })
 
-    # 6. Formatting Prompt Stack
-    context_mems = []
-    for idx, m in enumerate(unique_memories, 1):
-        pid = m["module_id"]
-        mod = manager.get_module(pid)
-        ts = mod.vault[m["memory_id"]].get("timestamp") if mod else None
-        img = mod.vault[m["memory_id"]].get("image_url") if mod else None
-        
-        if ts:
-            formatted_date = datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+    # 5b. Temporal Discovery thought step
+    if req.temporal_discovery:
+        t_count = len(unique_memories)
+        if t_count > 0:
+            age_summaries = []
+            for m in unique_memories:
+                pid = m["module_id"]
+                mod = manager.get_module(pid)
+                vault_entry = mod.vault.get(m["memory_id"]) if mod else None
+                ts = vault_entry.get("timestamp") if vault_entry else time.time()
+                age_str = _format_age(time.time() - ts)
+                age_summaries.append(f"[{m['module_name']}] {age_str}")
+            t_detail = f"Temporal Discovery active: computed relative age of {t_count} memory nodes: {', '.join(age_summaries)}."
         else:
-            formatted_date = "Date Unknown"
-        
-        img_info = f"\n  * Image Archive Path: {img}" if img else ""
-        context_mems.append(
-            f"- RECALLED SYNAPSE {idx} [Expert Module: {m['module_name']}]:\n"
-            f"  * Content: {m['text']}\n"
-            f"  * Tags/Metadata: {m['tags']}\n"
-            f"  * Recorded At: {formatted_date}"
-            f"{img_info}"
-        )
-        
-    context_block = "\n\n".join(context_mems) if context_mems else ""
+            t_detail = "Temporal Discovery active: 0 memory nodes retrieved."
+        agentic_steps.append({
+            "step": "Temporal Discovery reasoning",
+            "status": "active",
+            "detail": t_detail
+        })
+    else:
+        agentic_steps.append({
+            "step": "Temporal Discovery reasoning",
+            "status": "disabled",
+            "detail": "Temporal reasoning and time-delta injection disabled by switch."
+        })
+
+    # 6. Formatting Prompt Stack
+    now_ts = time.time()
+    context_block = format_temporal_memory_block(unique_memories, now_ts, req.temporal_discovery)
     curr_date = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     directives_block = "\n".join(active_directives) if active_directives else "* No specialized expertise guidelines active for this pipeline."
@@ -1401,12 +1545,19 @@ def process_chat(req: ChatRequest, background_tasks: BackgroundTasks):
         "4. STRICT TRUTH RULE: Carefully read the entire [ERN SUBCONSCIOUS RECALL] block. Answer questions about "
         "companies, entities, events, personal details, or past facts ONLY if they are mentioned in the listed RECALLED SYNAPSES.\n"
         "5. DYNAMIC IMAGE RENDERING: You CAN display and reference original images to the user! If a recalled memory contains an `Image Archive Path` URL, render inline standard Markdown tag exactly like: `![Visual Archive](/static/uploads/filename.png)`.\n"
+    )
+
+    if req.temporal_discovery:
+        system_prompt += (
+            "6. TEMPORAL DISCOVERY MODE ACTIVE: The memories below are chronologically ordered (oldest to newest) with precise code-computed human ages (e.g. [2h 15m ago]).\n"
+            "   - Use these deterministic timestamps to resolve temporal references (e.g. 'what did I say earlier', 'last week', 'yesterday').\n"
+            "   - Understand the progressive sequence of the user's journey. Trust these timestamps absolutely.\n"
+        )
+
+    system_prompt += (
         "\n[ACTIVE EXPERTISE RULES & MODULE DIRECTIVES]:\n"
         f"{directives_block}\n\n"
-    )
-    system_prompt += (
-        f"[ERN SUBCONSCIOUS RECALL]:\n"
-        f"{context_block if context_block else 'No relevant memories retrieved.'}"
+        f"{context_block}"
     )
 
     messages_payload = (
@@ -1462,7 +1613,14 @@ def manual_store(req: MemoryStoreRequest, module_id: str = "default-memory"):
     mod = manager.get_module(module_id)
     if not mod:
         return {"error": f"Module {module_id} not found."}
-    mem_id = mod.encode_hebbian(text=req.text, tags=req.tags)
+    if req.memory_type:
+        mtype = req.memory_type
+        tags = req.tags
+    else:
+        tags, mtype = _classify_message(req.text)
+        if req.tags:
+            tags = f"{req.tags}, {tags}"
+    mem_id = mod.encode_hebbian(text=req.text, tags=tags, memory_type=mtype)
     return {"status": f"Stored in module '{mod.name}'", "id": mem_id}
 
 
@@ -1627,6 +1785,10 @@ def get_all_memories(q: Optional[str] = None, module_id: str = "default-memory")
             energy = mod.energies[idx].item() if idx >= 0 else 0.0
             stp_energy = mod.short_term_energies[idx].item() if idx >= 0 else 0.0
 
+            mtype = data.get("memory_type")
+            if not mtype:
+                _, mtype = _classify_message(data["text"])
+
             if q:
                 q_lower = q.lower()
                 if q_lower not in data["text"].lower() and q_lower not in data["tags"].lower():
@@ -1636,6 +1798,7 @@ def get_all_memories(q: Optional[str] = None, module_id: str = "default-memory")
                 "memory_id": mem_id,
                 "text": data["text"],
                 "tags": data["tags"],
+                "memory_type": mtype,
                 "timestamp": data.get("timestamp", 0.0),
                 "energy": round(energy, 3),
                 "stp_energy": round(stp_energy, 3),
@@ -2460,6 +2623,10 @@ Awaiting input...</div>
       <span class="ctrl-label">AGENTIC SEARCH</span>
       <button id="agenticToggleBtn" onclick="toggleAgenticSearch()" style="background:transparent; border:1px solid var(--g0); color:var(--g0); padding:3px 8px; font-family:var(--font-hud); font-size:0.6rem; cursor:pointer; letter-spacing:0.08em; transition: all 0.15s; outline:none; text-shadow: 0 0 6px var(--g0);">ON</button>
     </div>
+    <div class="ctrl-group">
+      <span class="ctrl-label">TEMPORAL DISCOVERY</span>
+      <button id="temporalToggleBtn" onclick="toggleTemporalDiscovery()" style="background:transparent; border:1px solid var(--g0); color:var(--g0); padding:3px 8px; font-family:var(--font-hud); font-size:0.6rem; cursor:pointer; letter-spacing:0.08em; transition: all 0.15s; outline:none; text-shadow: 0 0 6px var(--g0);">ON</button>
+    </div>
     <div class="ctrl-group" style="margin-left:auto;">
       <span class="ctrl-label" style="color:#3a5a4a;">HIST</span>
       <span class="val-badge" id="hist-len" style="color:var(--text-dim)">0</span>
@@ -2602,6 +2769,7 @@ let lastResonances = [];
 let activeTab      = 'recall';
 let activeMainView = 'chat';
 let useAgenticSearch = true;
+let useTemporalDiscovery = true;
 let vaultMemories   = [];
 const pendingModules = {};
 const DEFAULT_MODEL = "qwen2.5-coder:7b";
@@ -2621,6 +2789,23 @@ function toggleAgenticSearch() {
     btn.style.textShadow = 'none';
   }
   pushToast(`Agentic Search toggled ${useAgenticSearch ? 'ON' : 'OFF'}`);
+}
+
+function toggleTemporalDiscovery() {
+  useTemporalDiscovery = !useTemporalDiscovery;
+  const btn = document.getElementById('temporalToggleBtn');
+  if (useTemporalDiscovery) {
+    btn.textContent = 'ON';
+    btn.style.borderColor = 'var(--g0)';
+    btn.style.color = 'var(--g0)';
+    btn.style.textShadow = '0 0 6px var(--g0)';
+  } else {
+    btn.textContent = 'OFF';
+    btn.style.borderColor = 'var(--dim)';
+    btn.style.color = 'var(--text-dim)';
+    btn.style.textShadow = 'none';
+  }
+  pushToast(`Temporal Discovery toggled ${useTemporalDiscovery ? 'ON' : 'OFF'}`);
 }
 
 function toggleCognitionPanel(el) {
@@ -2662,10 +2847,16 @@ function renderVaultList(mems) {
     
     const formattedDate = m.timestamp ? new Date(m.timestamp * 1000).toLocaleString() : 'Date Unknown';
     const moduleBadge = isGlobal && m.module_name
-      ? `<span style="font-size:0.55rem; background: rgba(0,255,136,0.1); border: 1px solid var(--g3); color: var(--g1); padding: 1px 5px; border-radius: 3px; margin-left: 6px; font-family: var(--font-mono);">${m.module_name}</span>`
+      ? `<span style="display: inline-block; white-space: nowrap; font-size:0.55rem; background: rgba(0,255,136,0.1); border: 1px solid var(--g3); color: var(--g1); padding: 1px 5px; border-radius: 3px; margin-left: 6px; font-family: var(--font-mono);">${m.module_name}</span>`
       : '';
     
-    card.innerHTML = `<div class="mc-tags">${m.tags}${moduleBadge}</div>` +
+    const mType = m.memory_type || 'fact';
+    let typeBadgeColor = '#00bcff';
+    if (mType === 'question') typeBadgeColor = '#ffb300';
+    if (mType === 'instruction') typeBadgeColor = '#00ff88';
+    const typeBadge = `<span style="display: inline-block; white-space: nowrap; font-size:0.55rem; background: rgba(0,0,0,0.3); border: 1px solid ${typeBadgeColor}; color: ${typeBadgeColor}; padding: 1px 5px; border-radius: 3px; margin-left: 6px; font-family: var(--font-mono); text-transform: uppercase;">${mType}</span>`;
+    
+    card.innerHTML = `<div class="mc-tags">${m.tags}${moduleBadge}${typeBadge}</div>` +
                      `<div style="word-break: break-word;">${m.text}</div>` +
                      imgHtml +
                      `<div class="mc-energy">${m.energy.toFixed(3)} LTP | ${m.stp_energy ? m.stp_energy.toFixed(3) : '0.000'} STP</div>` +
@@ -3036,14 +3227,15 @@ async function send() {
     const res  = await fetch('/api/chat', {
       method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({
-        message        : text,
-        model          : document.getElementById('modelSelect').value,
-        history        : chatHistory.slice(-6),
-        focus_threshold: parseFloat(document.getElementById('focusSlider').value),
-        agentic_search : useAgenticSearch,
-        auto_route     : isAutoRoute,
-        pipeline       : customPipeline,
-        active_expert  : isAutoRoute ? null : selectedExpert
+        message            : text,
+        model              : document.getElementById('modelSelect').value,
+        history            : chatHistory.slice(-6),
+        focus_threshold    : parseFloat(document.getElementById('focusSlider').value),
+        agentic_search     : useAgenticSearch,
+        temporal_discovery : useTemporalDiscovery,
+        auto_route         : isAutoRoute,
+        pipeline           : customPipeline,
+        active_expert      : isAutoRoute ? null : selectedExpert
       })
     });
     
@@ -3170,7 +3362,13 @@ async function send() {
         
         const formattedDate = m.timestamp ? new Date(m.timestamp * 1000).toLocaleString() : 'Date Unknown';
         
-        card.innerHTML = `<div class="mc-tags">[Expert: ${m.module_name || 'default-memory'}] | ${m.tags}</div>` +
+        const mType = m.memory_type || 'fact';
+        let typeBadgeColor = '#00bcff';
+        if (mType === 'question') typeBadgeColor = '#ffb300';
+        if (mType === 'instruction') typeBadgeColor = '#00ff88';
+        const typeBadge = `<span style="display: inline-block; white-space: nowrap; font-size:0.55rem; background: rgba(0,0,0,0.3); border: 1px solid ${typeBadgeColor}; color: ${typeBadgeColor}; padding: 1px 5px; border-radius: 3px; margin-left: 6px; font-family: var(--font-mono); text-transform: uppercase;">${mType}</span>`;
+        
+        card.innerHTML = `<div class="mc-tags">[Expert: ${m.module_name || 'default-memory'}] | ${m.tags}${typeBadge}</div>` +
                          `<div style="word-break: break-word;">${m.text}</div>` +
                          imgHtml +
                          `<div class="mc-resonance">${m.resonance.toFixed(3)} R</div>` +

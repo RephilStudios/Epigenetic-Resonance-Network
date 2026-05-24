@@ -6,6 +6,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Copy ern package folder and the main entrypoint
+COPY ern ./ern
 COPY dgx_agent_api.py .
 
 RUN mkdir -p /app/ern_state

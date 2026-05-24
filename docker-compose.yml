@@ -5,8 +5,13 @@ services:
     # Share the host's network stack so the container can reach
     # Ollama at localhost:11434 directly without routing issues
     network_mode: host
+    ipc: host
+    ulimits:
+      memlock: -1
+      stack: 67108864
     volumes:
       - ./ern_state:/app/ern_state
+      - ./ern:/app/ern
       - ./dgx_agent_api.py:/app/dgx_agent_api.py
     environment:
       - OLLAMA_URL=http://localhost:11434/api/chat

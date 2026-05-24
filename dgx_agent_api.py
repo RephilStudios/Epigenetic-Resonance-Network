@@ -57,6 +57,7 @@ class ChatRequest(BaseModel):
     agentic_search: bool = True
     pipeline: Optional[List[str]] = None
     auto_route: bool = False
+    active_expert: Optional[str] = None
 
 class ChatResponse(BaseModel):
     reply: str
@@ -689,28 +690,29 @@ manager = ERNModuleManager()
 def route_query_to_modules(user_message: str, available_modules: List[Dict[str, Any]]) -> List[str]:
     print("\n[SYSTEM] Commencing dynamic cognitive routing...")
     
+    # Exclude frozen modules and default-memory from routing candidates
+    routable = [m for m in available_modules if not m["config"].get("frozen", False) and m["config"]["module_id"] != "default-memory"]
+    if not routable:
+        return ["default-memory"]
+
     modules_desc = []
-    for m in available_modules:
+    for m in routable:
         config = m["config"]
         modules_desc.append(f"- ID: '{config['module_id']}' | Name: '{config['name']}' | Description: '{config['description']}'")
         
     modules_str = "\n".join(modules_desc)
+    valid_ids = [m["config"]["module_id"] for m in routable]
     
     routing_prompt = (
-        "You are the Epigenetic Memory Router Agent for a multi-module Mixture of Experts memory matrix.\n"
-        "Your task is to analyze the user's message and determine which memory modules are relevant and should be queried for context.\n\n"
-        "AVAILABLE MEMORY MODULES:\n"
+        "You are an Epigenetic Memory Router. Select which memory module IDs to query for the user's message.\n\n"
+        "AVAILABLE MODULES:\n"
         f"{modules_str}\n\n"
         "RULES:\n"
-        "1. Identify the module IDs that contain background context, guidelines, preferences, or history relevant to the User's message.\n"
-        "2. Output ONLY a comma-separated list of the relevant Module IDs, in order of query execution (from most relevant to least relevant).\n"
-        "3. If no modules are relevant, or it is a simple greeting/conversational phrase that doesn't need memory context, output exactly: NONE\n"
-        "4. Avoid adding any introductory, explanatory, or concluding text. Do not output anything except the IDs or NONE.\n\n"
-        "EXAMPLES:\n"
-        "User: How do I implement a standard Fast API router in our styling?\n"
-        "Output: coding-constitution, default-memory\n\n"
-        "User: Hello there, how are you today?\n"
-        "Output: NONE\n\n"
+        "1. Output ONLY a comma-separated list of module IDs from the list above. Nothing else.\n"
+        "2. Pick modules whose description matches the topic of the user's message.\n"
+        "3. If nothing matches or it is a greeting, output exactly: NONE\n"
+        "4. Do NOT include quotes, explanations, or any other text.\n\n"
+        f"Valid IDs: {', '.join(valid_ids)}\n"
         f"User: {user_message}\n"
         "Output:"
     )
@@ -720,27 +722,29 @@ def route_query_to_modules(user_message: str, available_modules: List[Dict[str, 
             "model"   : JUDGE_MODEL,
             "messages": [{"role": "user", "content": routing_prompt}],
             "stream"  : False,
-            "options" : {"temperature": 0.0, "max_tokens": 100},
-        }, timeout=30)
+            "options" : {"temperature": 0.0, "num_predict": 60},
+        }, timeout=20)
         
         output = res.json().get("message", {}).get("content", "").strip()
-        print(f"[ROUTER] Raw router output: '{output}'")
+        # Strip markdown, quotes, backticks
+        output = re.sub(r'[`*"\']', '', output).strip()
+        print(f"[ROUTER] Raw output: '{output}'")
         
-        if "NONE" in output.upper():
-            return []
+        if not output or "NONE" in output.upper():
+            return ["default-memory"]
             
-        raw_ids = [idx.strip() for idx in output.split(",") if idx.strip()]
-        valid_ids = [m["config"]["module_id"] for m in available_modules]
+        raw_ids = [idx.strip() for idx in re.split(r'[,\s]+', output) if idx.strip()]
+        selected_ids = [rid for rid in raw_ids if rid in valid_ids]
         
-        selected_ids = []
-        for rid in raw_ids:
-            rid_clean = re.sub(r"['\"`]", "", rid).strip()
-            if rid_clean in valid_ids and rid_clean not in selected_ids:
-                selected_ids.append(rid_clean)
-                
+        if not selected_ids:
+            print(f"[ROUTER] No valid IDs parsed from '{output}', using default-memory.")
+            return ["default-memory"]
+
+        print(f"[ROUTER] Selected modules: {selected_ids}")
         return selected_ids
+
     except Exception as e:
-        print(f"[WARNING] Dynamic routing agent failed: {e}. Falling back to default-memory.")
+        print(f"[ROUTER] Failed ({e}), using default-memory.")
         return ["default-memory"]
 
 
@@ -801,42 +805,38 @@ def agentic_search_planner(user_message: str) -> List[str]:
 
 
 def run_memory_judge(user_message: str, prior_memories: str = "", target_module_id: str = "default-memory"):
-    print(f"\n[SYSTEM] Background memory judge started (targeting {target_module_id})...")
+    print(f"\n[MEMORY JUDGE] Starting — target: '{target_module_id}' — message: '{user_message[:80]}'")
+
+    # Skip obviously empty or pure greeting messages
+    stripped = user_message.strip().lower()
+    trivial = {"hi", "hello", "hey", "ok", "okay", "thanks", "thank you", "bye", "yes", "no", "sure", "cool", "nice"}
+    if stripped in trivial or len(stripped) < 8:
+        print("[MEMORY JUDGE] Trivial message — skipping.")
+        return
+
+    target_mod = manager.get_module(target_module_id)
+    if not target_mod:
+        target_mod = manager.get_module("default-memory")
+    if not target_mod:
+        print("[MEMORY JUDGE] ERROR: No target module found. Aborting.")
+        return
+
+    # Simple, direct prompt that qwen2.5-coder can reliably follow
     salience_prompt = (
-        "You are a strict Epigenetic Memory Extractor. Your ONLY job is to find concrete, factual, real-world information"
-        " that the USER explicitly stated in their message and that is worth remembering long-term.\n\n"
-        "STRICT RULES:\n"
-        "1. Extract facts ONLY from the USER message. NEVER invent facts or derive them from context.\n"
-        "2. ONLY save information that is objectively factual, real, and permanently relevant "
-        "(e.g. names, locations, preferences, technical facts, stated goals, explicit instructions to the AI).\n"
-        "3. NEVER save: greetings, questions, hypotheticals, opinions, emotions, AI responses, or conversational filler.\n"
-        "4. NEVER save a fact already in PRIOR MEMORIES.\n"
-        "5. You MAY extract MULTIPLE facts from one message. Use one FACT/TAGS block per fact.\n"
-        "6. If there is NOTHING worth saving, output EXACTLY: ACTION: DISCARD\n\n"
-        "OUTPUT FORMAT (repeat the FACT/TAGS block for each distinct fact):\n"
-        "ACTION: SAVE\n"
-        "FACT: <One concrete, self-contained fact>\n"
-        "TAGS: <Comma-separated topics and ONE importance level: Critical, High, Medium, or Low>\n"
-        "FACT: <Another fact if present>\n"
-        "TAGS: <Tags for that fact>\n\n"
-        "EXAMPLES:\n\n"
-        "Prior Memories: None\n"
-        "User: My name is Alex, I work at NVIDIA as a software engineer and my dog is called Max.\n"
-        "Output:\n"
-        "ACTION: SAVE\n"
-        "FACT: The user's name is Alex.\n"
-        "TAGS: Identity, Name, Importance: Critical\n"
-        "FACT: Alex works at NVIDIA as a software engineer.\n"
-        "TAGS: Work, Career, NVIDIA, Importance: High\n"
-        "FACT: Alex's dog is named Max.\n"
-        "TAGS: Pets, Dogs, Personal Life, Importance: Medium\n\n"
-        "Prior Memories: None\n"
-        "User: hey whats up\n"
-        "Output:\n"
-        "ACTION: DISCARD\n\n"
-        f"Prior Memories: {prior_memories if prior_memories else 'None'}\n"
+        f"Extract memorable facts from this user message. "
+        f"Output each fact on its own line starting with FACT: followed by a comma-separated TAGS: line. "
+        f"If nothing is worth remembering (e.g. greetings, filler), output only: DISCARD\n\n"
+        f"Rules:\n"
+        f"- Extract: names, facts, preferences, theories, guidelines, instructions, technical decisions\n"
+        f"- Skip: greetings, questions with no info, filler words\n"
+        f"- Do NOT add explanation. Output ONLY the FACT/TAGS lines or DISCARD.\n\n"
+        f"Example:\n"
+        f"User: My name is Reid and I prefer dark mode UI with HSL colors.\n"
+        f"FACT: The user's name is Reid.\n"
+        f"TAGS: Identity, Name, Importance: Critical\n"
+        f"FACT: User prefers dark mode UI with HSL colors.\n"
+        f"TAGS: UI, Preferences, Design, Importance: High\n\n"
         f"User: {user_message}\n"
-        "Output:"
     )
 
     try:
@@ -844,56 +844,70 @@ def run_memory_judge(user_message: str, prior_memories: str = "", target_module_
             "model"   : JUDGE_MODEL,
             "messages": [{"role": "user", "content": salience_prompt}],
             "stream"  : False,
-            "options" : {"temperature": 0.0},
-        }, timeout=180)
+            "options" : {"temperature": 0.0, "num_predict": 300},
+        }, timeout=60)
 
-        extracted = res.json().get("message", {}).get("content", "").strip()
-        if extracted.upper().startswith("OUTPUT:"):
-            extracted = extracted[7:].strip()
+        raw = res.json().get("message", {}).get("content", "").strip()
+        print(f"[MEMORY JUDGE] Raw LLM output: {repr(raw[:300])}")
 
-        print(f"[MEMORY JUDGE] Raw output:\n{extracted}")
-
-        cleaned = extracted.replace("*", "")
-        cleaned = re.sub(r'(?i)fact\s*:\s*', 'FACT: ', cleaned)
-        cleaned = re.sub(r'(?i)tags\s*:\s*', 'TAGS: ', cleaned)
-        cleaned = re.sub(r'(?i)action\s*:\s*', 'ACTION: ', cleaned)
-
-        is_discard = "ACTION: DISCARD" in cleaned.upper()
-        has_facts = "FACT:" in cleaned.upper()
-
-        if is_discard and not has_facts:
-            print("[MEMORY JUDGE] Discarded — no salient facts found.")
+        # Hard discard check
+        if not raw or "DISCARD" in raw.upper().split("\n")[0]:
+            print("[MEMORY JUDGE] LLM said DISCARD or empty — skipping.")
             return
 
-        target_mod = manager.get_module(target_module_id)
-        if not target_mod:
-            target_mod = manager.get_module("default-memory")
+        # Aggressive parsing — strip markdown, asterisks, code fences
+        cleaned = raw
+        cleaned = re.sub(r'```.*?```', '', cleaned, flags=re.DOTALL)
+        cleaned = cleaned.replace("*", "").replace("`", "").replace("#", "")
+        cleaned = re.sub(r'(?i)\baction\s*:\s*save\b', '', cleaned)
+        cleaned = re.sub(r'(?i)\baction\s*:\s*discard\b', '', cleaned)
+        cleaned = re.sub(r'(?i)^fact\s*:', 'FACT:', cleaned, flags=re.MULTILINE)
+        cleaned = re.sub(r'(?i)^tags\s*:', 'TAGS:', cleaned, flags=re.MULTILINE)
 
-        blocks      = re.split(r'(?=FACT:)', cleaned, flags=re.IGNORECASE)
+        # Split into fact blocks
+        fact_blocks = re.split(r'(?=^FACT:)', cleaned, flags=re.MULTILINE)
         saved_count = 0
-        for block in blocks:
+
+        for block in fact_blocks:
             block = block.strip()
-            if not block or not block.upper().startswith("FACT:"):
+            if not block.upper().startswith("FACT:"):
                 continue
-            fact_match = re.search(r'FACT:\s*(.*?)(?=TAGS:|$)', block, re.IGNORECASE | re.DOTALL)
-            tags_match = re.search(r'TAGS:\s*(.*?)(?=FACT:|$)', block, re.IGNORECASE | re.DOTALL)
+            fact_match = re.search(r'^FACT:\s*(.+?)(?=^TAGS:|$)', block, re.IGNORECASE | re.MULTILINE | re.DOTALL)
+            tags_match = re.search(r'^TAGS:\s*(.+)', block, re.IGNORECASE | re.MULTILINE)
             if not fact_match:
                 continue
-            fact = fact_match.group(1).strip()
-            tags = tags_match.group(1).strip() if tags_match else "Context: General, Importance: Low"
+            fact = fact_match.group(1).strip().replace("\n", " ")
+            tags = tags_match.group(1).strip() if tags_match else "General, Importance: Medium"
             if not fact or len(fact) < 5:
                 continue
-            print(f"[MEMORY JUDGE] Encoding fact {saved_count + 1} into '{target_mod.name}': {fact}")
+            print(f"[MEMORY JUDGE] Saving fact to '{target_mod.name}': {fact[:100]}")
             target_mod.encode_hebbian(text=fact, tags=tags)
             saved_count += 1
 
-        if saved_count == 0:
-            print("[MEMORY JUDGE] No valid fact blocks parsed — discarded.")
+        if saved_count > 0:
+            print(f"[MEMORY JUDGE] ✓ Saved {saved_count} fact(s) to '{target_mod.name}'.")
         else:
-            print(f"[MEMORY JUDGE] Saved {saved_count} fact(s) to module '{target_mod.name}' PyTorch memory.")
+            # FALLBACK: LLM returned garbage we couldn't parse — save the raw message
+            print(f"[MEMORY JUDGE] Parser found 0 facts from LLM output. Saving raw message as fallback.")
+            target_mod.encode_hebbian(
+                text=user_message[:500],
+                tags="User Message, Auto-Captured, Importance: Medium"
+            )
 
     except Exception as e:
-        print(f"[WARNING] Background extraction failed: {e}")
+        print(f"[MEMORY JUDGE] EXCEPTION: {e}")
+        # Even on exception, save the raw message so nothing is lost
+        try:
+            if target_mod:
+                print(f"[MEMORY JUDGE] Exception fallback — saving raw message to '{target_mod.name}'.")
+                target_mod.encode_hebbian(
+                    text=user_message[:500],
+                    tags="User Message, Exception-Fallback, Importance: Medium"
+                )
+        except Exception as e2:
+            print(f"[MEMORY JUDGE] FATAL fallback failed too: {e2}")
+
+
 
 
 def extract_text_from_pdf(pdf_bytes: bytes) -> str:
@@ -1100,9 +1114,95 @@ def process_image_background(image_bytes: bytes, filename: str, image_url: Optio
         print(f"[ERROR] Background image processing failed: {e}")
 
 
+
+
 # ==========================================
 # 5. Endpoints
 # ==========================================
+
+def _heuristic_tags(text: str) -> str:
+    """Generate meaningful tags from message text using fast keyword heuristics."""
+    t = text.lower()
+    tags = []
+
+    # ── Message type ──────────────────────────────────────────────────────────
+    q_starters = ("what", "who", "where", "when", "why", "how", "is ", "are ", "can ", "could ", "do ", "does ", "should ", "would ", "will ")
+    is_question = text.strip().endswith("?") or t.startswith(q_starters)
+    is_instruction = any(w in t for w in ("please", "make sure", "always", "never", "remember", "save", "store", "keep", "use ", "don't", "do not", "ensure"))
+    is_personal = any(w in t for w in ("my name", "i am", "i'm", "i work", "i live", "i like", "i prefer", "my ", "i've", "i have", "i use"))
+
+    if is_question:
+        tags.append("Question")
+    elif is_instruction:
+        tags.append("Instruction")
+    elif is_personal:
+        tags.append("Personal Statement")
+    else:
+        tags.append("Statement")
+
+    # ── Topic categories ──────────────────────────────────────────────────────
+    topic_map = {
+        "Philosophy":   ("philosophy", "consciousness", "cosmopsychism", "theory", "metaphysics", "ontology", "epistemology", "ethics", "existence", "mind", "soul", "universe"),
+        "Coding":       ("code", "function", "class", "api", "python", "javascript", "typescript", "docker", "endpoint", "bug", "error", "refactor", "module", "import", "library", "algorithm", "variable"),
+        "AI/ML":        ("model", "llm", "neural", "embedding", "training", "inference", "transformer", "weight", "tensor", "pytorch", "ollama", "prompt", "token"),
+        "Memory/ERN":   ("memory", "synapse", "hebbian", "module", "pipeline", "expert", "moe", "recall", "encode", "ern", "vault", "delta", "resonance"),
+        "Design/UI":    ("ui", "design", "style", "css", "color", "layout", "theme", "dark mode", "font", "interface", "hsl", "gradient", "animation"),
+        "Identity":     ("my name", "i am", "i'm ", "i work", "i live", "i'm called", "my job", "my role"),
+        "Preferences":  ("prefer", "i like", "i love", "i hate", "i want", "i need", "favorite", "always use", "never use"),
+        "Technical":    ("server", "database", "container", "network", "config", "setup", "deploy", "install", "run", "build", "port", "volume", "gpu"),
+        "Science":      ("physics", "quantum", "biology", "chemistry", "math", "equation", "theory", "research", "experiment"),
+        "Creative":     ("write", "story", "poem", "art", "music", "draw", "create", "imagine", "generate"),
+    }
+
+    matched_topics = []
+    for topic, keywords in topic_map.items():
+        if any(kw in t for kw in keywords):
+            matched_topics.append(topic)
+
+    if matched_topics:
+        tags.extend(matched_topics[:3])  # Max 3 topics to keep tags clean
+    else:
+        tags.append("General")
+
+    # ── Importance ────────────────────────────────────────────────────────────
+    critical_signals = ("my name is", "i am ", "i'm ", "remember this", "save this", "important", "critical", "always", "never forget", "cosmopsychism")
+    high_signals     = ("prefer", "i like", "i use", "i work", "my project", "our system", "theory", "guideline", "instruction")
+    low_signals      = ("what is", "how do", "can you", "?")
+
+    if any(sig in t for sig in critical_signals):
+        importance = "Importance: Critical"
+    elif any(sig in t for sig in high_signals):
+        importance = "Importance: High"
+    elif is_question or any(sig in t for sig in low_signals):
+        importance = "Importance: Low"
+    else:
+        importance = "Importance: Medium"
+
+    tags.append(importance)
+    return ", ".join(tags)
+
+
+def _direct_save_message(user_message: str, target_module_id: str) -> None:
+    """Synchronously save a user message directly to a module — no LLM, guaranteed."""
+    TRIVIAL = {"hi", "hello", "hey", "ok", "okay", "thanks", "thank you",
+               "bye", "yes", "no", "sure", "cool", "nice", "lol", "haha", "yep", "nope"}
+    stripped = user_message.strip()
+    if len(stripped) < 12 or stripped.lower() in TRIVIAL:
+        print(f"[DIRECT SAVE] Skipping trivial message.")
+        return
+    try:
+        mod = manager.get_module(target_module_id)
+        if not mod:
+            mod = manager.get_module("default-memory")
+        if not mod:
+            print(f"[DIRECT SAVE] ERROR: Could not resolve module '{target_module_id}'")
+            return
+        tags = _heuristic_tags(stripped)
+        mem_id = mod.encode_hebbian(text=stripped[:500], tags=tags)
+        print(f"[DIRECT SAVE] ✓ Saved to '{mod.name}' | tags: {tags} | id={mem_id}")
+    except Exception as e:
+        print(f"[DIRECT SAVE] EXCEPTION: {e}")
+
 @app.post("/api/chat", response_model=ChatResponse)
 def process_chat(req: ChatRequest, background_tasks: BackgroundTasks):
     user_message = req.message
@@ -1111,14 +1211,19 @@ def process_chat(req: ChatRequest, background_tasks: BackgroundTasks):
     modules_list = manager.list_modules()
     if req.auto_route:
         pipeline_ids = route_query_to_modules(user_message, modules_list)
-        if not pipeline_ids:
-            pipeline_ids = ["default-memory"]
+        # Always include default-memory as a fallback for context + memory saving
+        if "default-memory" not in pipeline_ids:
+            pipeline_ids.append("default-memory")
     elif req.pipeline:
         pipeline_ids = [pid for pid in req.pipeline if pid in manager.registry["modules"]]
         if not pipeline_ids:
             pipeline_ids = ["default-memory"]
     else:
         pipeline_ids = manager.registry.get("default_pipeline", ["default-memory"])
+    
+    # Safety: never operate with an empty pipeline
+    if not pipeline_ids:
+        pipeline_ids = ["default-memory"]
 
     print(f"[SYSTEM] Processing chat turn via active MOE pipeline: {pipeline_ids}")
 
@@ -1321,13 +1426,32 @@ def process_chat(req: ChatRequest, background_tasks: BackgroundTasks):
     except Exception as e:
         return ChatResponse(reply=f"Ollama Error: {e}", context_used=context_block, memories=unique_memories, agentic_steps=agentic_steps)
 
-    target_extraction_id = "default-memory"
-    for pid in pipeline_ids:
-        mod = manager.get_module(pid)
-        if mod and not mod.frozen:
-            target_extraction_id = pid
-            break
+    target_extraction_id = "default-memory"  # Always guaranteed fallback
 
+    # 1. Highest priority: explicit active expert from sidepanel (not auto-route, not default-memory)
+    if req.active_expert and req.active_expert not in ("default-memory", "auto-route") and req.active_expert in manager.registry["modules"]:
+        mod = manager.get_module(req.active_expert)
+        if mod and not mod.frozen:
+            target_extraction_id = req.active_expert
+            print(f"[MEMORY JUDGE TARGET] Pinned to active expert: {target_extraction_id}")
+
+    # 2. Otherwise scan pipeline for first mutable non-default module
+    elif not req.active_expert or req.active_expert in ("default-memory", "auto-route"):
+        for pid in pipeline_ids:
+            if pid == "default-memory":
+                continue
+            mod = manager.get_module(pid)
+            if mod and not mod.frozen:
+                target_extraction_id = pid
+                print(f"[MEMORY JUDGE TARGET] Resolved from pipeline: {target_extraction_id}")
+                break
+
+    print(f"[MEMORY] Saving to module: '{target_extraction_id}'")
+
+    # Direct synchronous save — no LLM judge, no background task, guaranteed every time
+    _direct_save_message(user_message, target_extraction_id)
+
+    # Also run LLM-based fact extraction in background as a bonus enhancement
     background_tasks.add_task(run_memory_judge, user_message, context_block, target_extraction_id)
 
     return ChatResponse(reply=bot_reply, context_used=context_block, memories=unique_memories, agentic_steps=agentic_steps)
@@ -1485,34 +1609,41 @@ def update_pipeline_endpoint(pipeline: List[str]):
 
 @app.get("/api/memories")
 def get_all_memories(q: Optional[str] = None, module_id: str = "default-memory"):
-    mod = manager.get_module(module_id)
-    if not mod:
-        return {"memories": [], "error": f"Module {module_id} not found."}
-        
+    # When auto-route is selected, only aggregate modules in the active pipeline
+    if module_id == "auto-route":
+        module_ids = manager.registry.get("default_pipeline", ["default-memory"])
+        if not module_ids:
+            module_ids = ["default-memory"]
+    else:
+        module_ids = [module_id]
+
     results = []
-    for mem_id, data in mod.vault.items():
-        idx = mod.labels.index(mem_id) if mem_id in mod.labels else -1
-        energy = mod.energies[idx].item() if idx >= 0 else 0.0
-        stp_energy = mod.short_term_energies[idx].item() if idx >= 0 else 0.0
-        
-        # Simple text search if query is provided
-        if q:
-            q_lower = q.lower()
-            text_match = q_lower in data["text"].lower()
-            tags_match = q_lower in data["tags"].lower()
-            if not (text_match or tags_match):
-                continue
-                
-        results.append({
-            "memory_id": mem_id,
-            "text": data["text"],
-            "tags": data["tags"],
-            "timestamp": data.get("timestamp", 0.0),
-            "energy": round(energy, 3),
-            "stp_energy": round(stp_energy, 3),
-            "image_url": data.get("image_url")
-        })
-    # Sort by timestamp descending
+    for mid in module_ids:
+        mod = manager.get_module(mid)
+        if not mod:
+            continue
+        for mem_id, data in mod.vault.items():
+            idx = mod.labels.index(mem_id) if mem_id in mod.labels else -1
+            energy = mod.energies[idx].item() if idx >= 0 else 0.0
+            stp_energy = mod.short_term_energies[idx].item() if idx >= 0 else 0.0
+
+            if q:
+                q_lower = q.lower()
+                if q_lower not in data["text"].lower() and q_lower not in data["tags"].lower():
+                    continue
+
+            results.append({
+                "memory_id": mem_id,
+                "text": data["text"],
+                "tags": data["tags"],
+                "timestamp": data.get("timestamp", 0.0),
+                "energy": round(energy, 3),
+                "stp_energy": round(stp_energy, 3),
+                "image_url": data.get("image_url"),
+                "module_id": mid,
+                "module_name": mod.name,
+            })
+
     results.sort(key=lambda x: x["timestamp"], reverse=True)
     return {"memories": results}
 
@@ -2208,22 +2339,78 @@ input:checked + .slider:before {
 .moe-builder-btn:hover {
   color: #fff;
 }
-.btn-delete-module {
-  background: transparent;
-  border: none;
-  color: var(--red);
-  cursor: pointer;
-  font-family: var(--font-mono);
-  font-size: 0.65rem;
-  opacity: 0.7;
-  transition: opacity 0.2s;
 }
 .btn-delete-module:hover {
   opacity: 1;
 }
+.modal-overlay {
+  display: none;
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100vw;
+  height: 100vh;
+  background: rgba(0, 0, 0, 0.75);
+  backdrop-filter: blur(8px);
+  z-index: 10000;
+  justify-content: center;
+  align-items: center;
+}
+.btn-create-expert-from-msg {
+  transition: all 0.2s ease;
+}
 </style>
 </head>
 <body>
+
+<!-- Beautiful Glassmorphic Expert Creator Modal -->
+<div id="expertCreatorModal" class="modal-overlay">
+  <div class="modal-content" style="background: var(--bg2); border: 1px solid var(--border); border-radius: 8px; width: 90%; max-width: 500px; padding: 20px; box-shadow: 0 20px 40px rgba(0,0,0,0.5); font-family: var(--font-hud);">
+    <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border); padding-bottom: 10px; margin-bottom: 15px;">
+      <span style="font-size: 0.95rem; font-weight: bold; color: var(--g0); letter-spacing: 0.05em;">📦 CREATE EXPERT FROM RESPONSE</span>
+      <span onclick="closeExpertCreatorModal()" style="color: var(--text-dim); cursor: pointer; font-size: 1.2rem; font-weight: bold;" onmouseover="this.style.color='var(--red)'" onmouseout="this.style.color='var(--text-dim)'">&times;</span>
+    </div>
+    
+    <div style="display: flex; flex-direction: column; gap: 12px;">
+      <div>
+        <label style="font-size: 0.65rem; color: var(--g1); font-family: var(--font-mono); display: block; margin-bottom: 4px;">EXPERT NAME:</label>
+        <input type="text" id="modalExpertName" value="Custom Advisor" style="width: 100%; background: var(--bg3); border: 1px solid var(--border); color: var(--text); padding: 8px; font-size: 0.8rem; border-radius: 4px; outline: none; font-family: var(--font-mono);" oninput="autoGenModalId(this.value)">
+      </div>
+      <div>
+        <label style="font-size: 0.65rem; color: var(--g1); font-family: var(--font-mono); display: block; margin-bottom: 4px;">EXPERT ID (SLUG):</label>
+        <input type="text" id="modalExpertId" value="custom-advisor" style="width: 100%; background: var(--bg3); border: 1px solid var(--border); color: var(--text); padding: 8px; font-size: 0.8rem; border-radius: 4px; outline: none; font-family: var(--font-mono);">
+      </div>
+      <div>
+        <label style="font-size: 0.65rem; color: var(--g1); font-family: var(--font-mono); display: block; margin-bottom: 4px;">DESCRIPTION:</label>
+        <textarea id="modalExpertDesc" style="width: 100%; background: var(--bg3); border: 1px solid var(--border); color: var(--text); padding: 8px; font-size: 0.8rem; border-radius: 4px; height: 50px; resize: none; outline: none; font-family: var(--font-mono);">An expert memory module generated dynamically from a curated response.</textarea>
+      </div>
+      <div>
+        <label style="font-size: 0.65rem; color: var(--g1); font-family: var(--font-mono); display: block; margin-bottom: 4px;">SYSTEM DIRECTIVE / EXPERTISE RULES:</label>
+        <textarea id="modalExpertDirective" style="width: 100%; background: var(--bg3); border: 1px solid var(--border); color: var(--text); padding: 8px; font-size: 0.8rem; border-radius: 4px; height: 110px; resize: vertical; outline: none; font-family: var(--font-mono);"></textarea>
+      </div>
+      
+      <div style="display: flex; gap: 10px;">
+        <div style="flex: 1;">
+          <label style="font-size: 0.65rem; color: var(--g1); font-family: var(--font-mono); display: block; margin-bottom: 4px;">LTP DECAY:</label>
+          <input type="number" id="modalExpertLtp" value="0.95" step="0.01" min="0.5" max="1" style="width: 100%; background: var(--bg3); border: 1px solid var(--border); color: var(--text); padding: 6px; font-size: 0.75rem; border-radius: 4px; outline: none; font-family: var(--font-mono);">
+        </div>
+        <div style="flex: 1;">
+          <label style="font-size: 0.65rem; color: var(--g1); font-family: var(--font-mono); display: block; margin-bottom: 4px;">STP DECAY:</label>
+          <input type="number" id="modalExpertStp" value="0.80" step="0.01" min="0.5" max="1" style="width: 100%; background: var(--bg3); border: 1px solid var(--border); color: var(--text); padding: 6px; font-size: 0.75rem; border-radius: 4px; outline: none; font-family: var(--font-mono);">
+        </div>
+        <div style="display: flex; flex-direction: column; justify-content: center; align-items: center; padding-left: 10px;">
+          <label style="font-size: 0.65rem; color: var(--g1); font-family: var(--font-mono); display: block; margin-bottom: 4px;">FROZEN:</label>
+          <input type="checkbox" id="modalExpertFrozen" style="width: 18px; height: 18px; cursor: pointer;">
+        </div>
+      </div>
+    </div>
+    
+    <div style="display: flex; justify-content: flex-end; gap: 10px; margin-top: 20px; border-top: 1px solid var(--border); padding-top: 15px;">
+      <button onclick="closeExpertCreatorModal()" style="background: transparent; border: 1px solid var(--border); color: var(--text-dim); padding: 6px 12px; font-size: 0.75rem; border-radius: 4px; cursor: pointer; font-family: var(--font-mono);" onmouseover="this.style.color='#fff'" onmouseout="this.style.color='var(--text-dim)'">CANCEL</button>
+      <button onclick="submitModalCreateExpert()" style="background: var(--g0); border: none; color: #000; padding: 6px 12px; font-size: 0.75rem; border-radius: 4px; cursor: pointer; font-weight: bold; font-family: var(--font-mono);" onmouseover="this.style.boxShadow='0 0 10px var(--g0)'" onmouseout="this.style.boxShadow='none'">⚡ CREATE & DEPLOY</button>
+    </div>
+  </div>
+</div>
 
 <div id="topbar">
   <div class="brand">ERN <span>//</span> DGX</div>
@@ -2346,7 +2533,7 @@ Awaiting input...</div>
   <div style="padding: 10px 10px 0 10px;">
     <div style="font-family:var(--font-mono); font-size:0.6rem; color:var(--g2); margin-bottom:4px; letter-spacing:0.05em;">ACTIVE SIDEPANEL EXPERT:</div>
     <select id="moduleSelectGlobal" onchange="onGlobalModuleChange()" style="width:100%; background:var(--bg3); border:1px solid var(--border); color:var(--g0); font-family:var(--font-mono); font-size:0.75rem; padding:6px; border-radius:4px; outline:none; cursor:pointer;">
-      <option value="default-memory">default-memory</option>
+      <option value="auto-route" selected>🧠 Dynamic Router (Auto-Route)</option>
     </select>
   </div>
 
@@ -2460,6 +2647,7 @@ function renderVaultList(mems) {
     scroll.innerHTML = '<div class="no-mem">No synapses in vault.</div>';
     return;
   }
+  const isGlobal = document.getElementById('moduleSelectGlobal').value === 'auto-route';
   mems.forEach(m => {
     const card = document.createElement('div');
     card.className = 'memory-card';
@@ -2473,13 +2661,16 @@ function renderVaultList(mems) {
     }
     
     const formattedDate = m.timestamp ? new Date(m.timestamp * 1000).toLocaleString() : 'Date Unknown';
+    const moduleBadge = isGlobal && m.module_name
+      ? `<span style="font-size:0.55rem; background: rgba(0,255,136,0.1); border: 1px solid var(--g3); color: var(--g1); padding: 1px 5px; border-radius: 3px; margin-left: 6px; font-family: var(--font-mono);">${m.module_name}</span>`
+      : '';
     
-    card.innerHTML = `<div class="mc-tags">${m.tags}</div>` +
+    card.innerHTML = `<div class="mc-tags">${m.tags}${moduleBadge}</div>` +
                      `<div style="word-break: break-word;">${m.text}</div>` +
                      imgHtml +
                      `<div class="mc-energy">${m.energy.toFixed(3)} LTP | ${m.stp_energy ? m.stp_energy.toFixed(3) : '0.000'} STP</div>` +
                      `<div class="mc-date" style="font-size: 0.58rem; color: var(--text-dim); margin-top: 4px; font-family: var(--font-hud);">${formattedDate}</div>` +
-                     `<button class="mc-forget" onclick="forgetMemory('${m.memory_id}')">FORGET</button>`;
+                     `<button class="mc-forget" onclick="forgetMemory('${m.memory_id}', '${m.module_id || ''}')">FORGET</button>`;
     scroll.appendChild(card);
   });
 }
@@ -2498,9 +2689,11 @@ function filterVault() {
 
 async function forgetMemory(memory_id, moduleId = null) {
   if (!confirm('Are you sure you want to forget/revert this memory synapse permanently?')) return;
+  // Use the memory's own module_id if provided, otherwise fall back to global selector
   const modId = moduleId || document.getElementById('moduleSelectGlobal').value;
+  const effectiveModId = (modId === 'auto-route') ? 'default-memory' : modId;
   try {
-    const res = await fetch(`/api/memory/${memory_id}?module_id=${modId}`, { method: 'DELETE' });
+    const res = await fetch(`/api/memory/${memory_id}?module_id=${effectiveModId}`, { method: 'DELETE' });
     if (!res.ok) throw new Error('Delete rejected');
     const data = await res.json();
     if (data.error) throw new Error(data.status);
@@ -2836,6 +3029,10 @@ async function send() {
       if(ld) ld.innerHTML = 'GENERATING<span class="thinking-dots"></span>';
     }, 300);
 
+    const selectedExpert = document.getElementById('moduleSelectGlobal') ? document.getElementById('moduleSelectGlobal').value : 'auto-route';
+    const isAutoRoute = (selectedExpert === 'auto-route');
+    const customPipeline = isAutoRoute ? getActivePipeline() : [selectedExpert];
+
     const res  = await fetch('/api/chat', {
       method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({
@@ -2844,8 +3041,9 @@ async function send() {
         history        : chatHistory.slice(-6),
         focus_threshold: parseFloat(document.getElementById('focusSlider').value),
         agentic_search : useAgenticSearch,
-        auto_route     : document.getElementById('moeAutoRoute') ? document.getElementById('moeAutoRoute').checked : false,
-        pipeline       : getActivePipeline()
+        auto_route     : isAutoRoute,
+        pipeline       : customPipeline,
+        active_expert  : isAutoRoute ? null : selectedExpert
       })
     });
     
@@ -2891,6 +3089,19 @@ async function send() {
     
     replyText.innerHTML = formattedReply;
     bDiv.appendChild(replyText);
+
+    // Append action button to build expert from this response
+    const actionDiv = document.createElement('div');
+    actionDiv.className = 'msg-actions';
+    actionDiv.style.marginTop = '8px';
+    actionDiv.style.display = 'flex';
+    actionDiv.style.justifyContent = 'flex-end';
+    actionDiv.innerHTML = `
+      <button class="btn-create-expert-from-msg" style="background: rgba(0,255,127,0.06); border: 1px solid rgba(0,255,127,0.4); color: var(--g0); font-family: var(--font-mono); font-size: 0.65rem; padding: 4px 8px; border-radius: 4px; cursor: pointer; display: flex; align-items: center; gap: 4px; transition: all 0.2s; font-weight: bold; letter-spacing: 0.03em;" onmouseover="this.style.background='var(--g0)'; this.style.color='#000'; this.style.borderColor='var(--g0)';" onmouseout="this.style.background='rgba(0,255,127,0.06)'; this.style.color='var(--g0)'; this.style.borderColor='rgba(0,255,127,0.4)';" onclick="openCreateExpertModalFromMsg(this)">
+        ➕ CREATE EXPERT FROM RESPONSE
+      </button>
+    `;
+    bDiv.appendChild(actionDiv);
 
     const steps = data.agentic_steps || [];
     if (steps.length > 0) {
@@ -3006,6 +3217,17 @@ let builderChatHistory = [];
 async function onGlobalModuleChange() {
   const modId = document.getElementById('moduleSelectGlobal').value;
   pushToast(`Active sidepanel expert switched to: ${modId}`);
+  
+  const autoRouteChk = document.getElementById('moeAutoRoute');
+  if (autoRouteChk) {
+    if (modId === 'auto-route') {
+      autoRouteChk.checked = true;
+    } else {
+      autoRouteChk.checked = false;
+    }
+    renderPipelineFlow();
+  }
+
   if (activeTab === 'vault')  loadVault();
   if (activeTab === 'deltas') loadDeltas();
   if (activeTab === 'stats')  refreshStats();
@@ -3019,10 +3241,18 @@ async function loadModulesUI() {
     moeModules = data.modules || [];
     defaultPipeline = data.default_pipeline || [];
     
-    // Update global dropdown select if options changed
+    // Preserve current selection; default to 'auto-route' on first load
     const globalSel = document.getElementById('moduleSelectGlobal');
-    const currentVal = globalSel.value;
+    const currentVal = globalSel.value || 'auto-route';
     globalSel.innerHTML = '';
+    
+    // Always first option: Dynamic Router
+    const routeOpt = document.createElement('option');
+    routeOpt.value = 'auto-route';
+    routeOpt.textContent = '🧠 Dynamic Router (Auto-Route)';
+    routeOpt.selected = (currentVal === 'auto-route');
+    globalSel.appendChild(routeOpt);
+
     moeModules.forEach(m => {
       const opt = document.createElement('option');
       opt.value = m.config.module_id;
@@ -3085,6 +3315,14 @@ function getActivePipeline() {
 
 async function toggleAutoRoute(checked) {
   pushToast(`Auto-Route ${checked ? 'enabled (Dynamic Routing)' : 'disabled (Static Pipeline)'}`);
+  const globalSel = document.getElementById('moduleSelectGlobal');
+  if (globalSel) {
+    if (checked) {
+      globalSel.value = 'auto-route';
+    } else {
+      globalSel.value = 'default-memory';
+    }
+  }
   renderPipelineFlow();
 }
 
@@ -3332,6 +3570,96 @@ function clearBuilderChat() {
   document.getElementById('builderMessages').innerHTML = '<div class="moe-builder-msg bot">Greetings. I am the ERN Expert Architect. Converse with me to design and customize a new expert memory module, or configure parameter thresholds.</div>';
 }
 
+function autoGenModalId(name) {
+  const slug = name.toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/(^-|-$)/g, '');
+  document.getElementById('modalExpertId').value = slug;
+}
+
+function openCreateExpertModalFromMsg(btn) {
+  // Extract original bot response text (exclude the actions div)
+  const botMsgDiv = btn.closest('.msg.bot');
+  // Clone it to manipulate without affecting live UI
+  const clone = botMsgDiv.cloneNode(true);
+  const actionsDiv = clone.querySelector('.msg-actions');
+  if (actionsDiv) actionsDiv.remove();
+  const monitorDiv = clone.querySelector('.cognition-monitor');
+  if (monitorDiv) monitorDiv.remove();
+  
+  // Get text content, clean spacing, and decode entity references if any
+  let text = clone.innerText.trim();
+  
+  // Smart pre-fill:
+  // Pre-fill Directive with the actual text or a summary
+  document.getElementById('modalExpertDirective').value = `Act according to these guidelines and rules:\n${text}`;
+  
+  // Set default name based on first 3 words
+  const words = text.split(/\s+/).slice(0, 3).join(' ');
+  const cleanName = words.replace(/[^a-zA-Z0-9\s]+/g, '').trim() || 'Custom Expert';
+  document.getElementById('modalExpertName').value = cleanName + ' Expert';
+  autoGenModalId(cleanName + ' Expert');
+  
+  // Open modal
+  document.getElementById('expertCreatorModal').style.display = 'flex';
+}
+
+function closeExpertCreatorModal() {
+  document.getElementById('expertCreatorModal').style.display = 'none';
+}
+
+async function submitModalCreateExpert() {
+  const name = document.getElementById('modalExpertName').value.trim();
+  const id = document.getElementById('modalExpertId').value.trim();
+  const desc = document.getElementById('modalExpertDesc').value.trim();
+  const directive = document.getElementById('modalExpertDirective').value.trim();
+  const ltp = parseFloat(document.getElementById('modalExpertLtp').value);
+  const stp = parseFloat(document.getElementById('modalExpertStp').value);
+  const frozen = document.getElementById('modalExpertFrozen').checked;
+  
+  if (!name || !id) {
+    pushToast("Name and ID are required fields!", true);
+    return;
+  }
+  
+  try {
+    pushToast(`Creating expert module '${id}'...`);
+    const res = await fetch('/api/modules', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        module_id: id,
+        name: name,
+        description: desc,
+        frozen: frozen,
+        ltp_decay_rate: ltp,
+        stp_decay_rate: stp,
+        sleep_threshold: 0.10,
+        focus_threshold: 0.15,
+        system_directive: directive
+      })
+    });
+    
+    if (!res.ok) throw new Error('API request failed');
+    const data = await res.json();
+    if (data.error) throw new Error(data.error);
+    
+    pushToast(`Successfully deployed Expert '${name}'!`);
+    closeExpertCreatorModal();
+    
+    // Automatically reload and switch global active expert to it
+    setTimeout(() => {
+      loadModulesUI().then(() => {
+        const globalSel = document.getElementById('moduleSelectGlobal');
+        globalSel.value = id;
+        onGlobalModuleChange();
+      });
+    }, 500);
+  } catch(e) {
+    pushToast(`Failed to deploy expert: ${e.message}`, true);
+  }
+}
+
 loadModels();
 loadModulesUI();
 refreshStats();
@@ -3339,6 +3667,54 @@ setInterval(() => {
   sparkData.push(Math.random() * 0.05);
   sparkData = sparkData.slice(-80);
 }, 2000);
+
+// ── Registry Watcher — auto-refresh UI when registry.json changes ─────────────
+let _registryFingerprint = '';
+async function _pollRegistryChanges() {
+  try {
+    const res = await fetch('/api/modules');
+    if (!res.ok) return;
+    const data = await res.json();
+    // Build a lightweight fingerprint: module IDs + pipeline
+    const fp = JSON.stringify({
+      ids: (data.modules || []).map(m => m.config.module_id).sort(),
+      pipeline: data.default_pipeline || [],
+      synapseCounts: (data.modules || []).map(m => `${m.config.module_id}:${m.synapses_count}`)
+    });
+    if (fp !== _registryFingerprint) {
+      if (_registryFingerprint !== '') {
+        // Registry changed — reload relevant panels silently
+        moeModules = data.modules || [];
+        defaultPipeline = data.default_pipeline || [];
+        
+        // Rebuild global dropdown preserving current selection
+        const globalSel = document.getElementById('moduleSelectGlobal');
+        const currentVal = globalSel.value;
+        globalSel.innerHTML = '';
+        const routeOpt = document.createElement('option');
+        routeOpt.value = 'auto-route';
+        routeOpt.textContent = '🧠 Dynamic Router (Auto-Route)';
+        routeOpt.selected = (currentVal === 'auto-route');
+        globalSel.appendChild(routeOpt);
+        moeModules.forEach(m => {
+          const opt = document.createElement('option');
+          opt.value = m.config.module_id;
+          opt.textContent = `${m.config.name} (${m.config.module_id})`;
+          if (m.config.module_id === currentVal) opt.selected = true;
+          globalSel.appendChild(opt);
+        });
+
+        renderPipelineFlow();
+        renderModulesList();
+        if (activeTab === 'vault')  loadVault();
+        if (activeTab === 'stats')  refreshStats();
+        pushToast('Registry updated — UI reloaded.');
+      }
+      _registryFingerprint = fp;
+    }
+  } catch(_) {}
+}
+setInterval(_pollRegistryChanges, 3000);
 </script>
 </body>
 </html>

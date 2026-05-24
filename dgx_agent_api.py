@@ -3,11 +3,17 @@ import uuid
 import time
 import math
 import re
+import datetime
 import requests
 import torch
 import torch.nn.functional as F
 import uvicorn
-from fastapi import FastAPI, BackgroundTasks
+import io
+import base64
+from PIL import Image
+from pypdf import PdfReader
+from fastapi import FastAPI, BackgroundTasks, UploadFile, File
+from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
@@ -29,9 +35,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Configure and mount local image archiving folders
+os.makedirs("ern_state/uploads", exist_ok=True)
+app.mount("/static", StaticFiles(directory="ern_state"), name="static")
+
 OLLAMA_URL    = os.environ.get("OLLAMA_URL", "http://localhost:11434/api/chat")
 DEFAULT_MODEL = "qwen2.5-coder:7b"
 JUDGE_MODEL   = "qwen2.5-coder:7b"
+VISION_MODEL  = os.environ.get("VISION_MODEL", "llama3.2-vision")
 SAVE_DIR      = "./ern_state"
 
 class Message(BaseModel):
@@ -164,6 +175,10 @@ class TensorDeltaStack:
                         engine.energies[:idx],
                         engine.energies[idx+1:]
                     ])
+                    engine.short_term_energies = torch.cat([
+                        engine.short_term_energies[:idx],
+                        engine.short_term_energies[idx+1:]
+                    ])
                     engine.labels.pop(idx)
                     engine.vault.pop(d.memory_id, None)
                 new_stack.pop(i)
@@ -183,6 +198,12 @@ class TensorDeltaStack:
                             engine.energies[:insert_at],
                             eng,
                             engine.energies[insert_at:]
+                        ])
+                        st_eng = torch.tensor([0.0], device=engine.device)
+                        engine.short_term_energies = torch.cat([
+                            engine.short_term_energies[:insert_at],
+                            st_eng,
+                            engine.short_term_energies[insert_at:]
                         ])
                         engine.labels.insert(insert_at, f"restored_{uuid.uuid4()}")
                 new_stack.pop(i)
@@ -226,10 +247,12 @@ class DenseEpigeneticEngine:
 
         self.memory_bank = torch.empty((0, self.dim), device=self.device)
         self.energies    = torch.empty((0,),          device=self.device)
+        self.short_term_energies = torch.empty((0,),  device=self.device)
         self.labels: List[str] = []
         self.vault: Dict[str, Any] = {}
 
-        self.decay_rate      = 0.95
+        self.ltp_decay_rate  = 0.95
+        self.stp_decay_rate  = 0.80
         self.sleep_threshold = 0.1
         self.query_count     = 0
 
@@ -244,16 +267,23 @@ class DenseEpigeneticEngine:
     def _now(self) -> float:
         return time.time()
 
-    def encode_hebbian(self, text: str, tags: str) -> str:
+    def encode_hebbian(self, text: str, tags: str, image_url: Optional[str] = None) -> str:
         memory_id = str(uuid.uuid4())
-        self.vault[memory_id] = {"text": text, "tags": tags, "timestamp": self._now()}
+        self.vault[memory_id] = {
+            "text": text,
+            "tags": tags,
+            "timestamp": self._now()
+        }
+        if image_url:
+            self.vault[memory_id]["image_url"] = image_url
 
         combined = f"{tags} {text}"
         vec = self._encode(combined)
 
         prev_size = self.memory_bank.size(0)
         self.memory_bank = torch.cat([self.memory_bank, vec], dim=0)
-        self.energies    = torch.cat([self.energies, torch.tensor([1.0], device=self.device)])
+        self.energies    = torch.cat([self.energies, torch.tensor([0.5], device=self.device)])
+        self.short_term_energies = torch.cat([self.short_term_energies, torch.tensor([2.0], device=self.device)])
         self.labels.append(memory_id)
 
         self.deltas.push(TensorDelta(
@@ -263,7 +293,7 @@ class DenseEpigeneticEngine:
             prev_size  = prev_size,
             next_size  = self.memory_bank.size(0),
             new_vec    = vec.cpu().clone(),
-            new_energy = 1.0,
+            new_energy = 0.5,
             memory_id  = memory_id,
         ))
 
@@ -281,9 +311,10 @@ class DenseEpigeneticEngine:
             delta_id     = str(uuid.uuid4()),
             prev_size    = prev_size,
             next_size    = prev_size,
-            decay_factor = self.decay_rate,
+            decay_factor = self.ltp_decay_rate,
         ))
-        self.energies = self.energies * self.decay_rate
+        self.energies = self.energies * self.ltp_decay_rate
+        self.short_term_energies = self.short_term_energies * self.stp_decay_rate
         self._save_state()
 
     def retrieve(self, query_text: str, top_k: int = 5, threshold: float = 0.15, decay: bool = True):
@@ -292,7 +323,7 @@ class DenseEpigeneticEngine:
 
         q_vec       = self._encode(query_text)
         similarities = F.cosine_similarity(q_vec, self.memory_bank)
-        resonance    = similarities * (1.0 + torch.log1p(self.energies))
+        resonance    = similarities * (1.0 + torch.log1p(self.energies + self.short_term_energies))
 
         prev_size = self.memory_bank.size(0)
         if decay:
@@ -302,9 +333,10 @@ class DenseEpigeneticEngine:
                 delta_id     = str(uuid.uuid4()),
                 prev_size    = prev_size,
                 next_size    = prev_size,
-                decay_factor = self.decay_rate,
+                decay_factor = self.ltp_decay_rate,
             ))
-            self.energies = self.energies * self.decay_rate
+            self.energies = self.energies * self.ltp_decay_rate
+            self.short_term_energies = self.short_term_energies * self.stp_decay_rate
 
         actual_k = min(top_k * 2, self.memory_bank.size(0))
         top_values, top_idx = torch.topk(resonance, k=actual_k)
@@ -316,8 +348,14 @@ class DenseEpigeneticEngine:
         for val, idx in zip(top_values.tolist(), top_idx.tolist()):
             if val > threshold:
                 old_e = self.energies[idx].item()
-                new_e = min(old_e + 0.3, 5.0)
+                old_st = self.short_term_energies[idx].item()
+
+                new_e = min(old_e + 0.3 + 0.1 * old_st, 5.0)
+                new_st = min(old_st + 0.5, 3.0)
+
                 self.energies[idx] = new_e
+                self.short_term_energies[idx] = new_st
+
                 boost_indices.append(idx)
                 boost_amounts.append(new_e - old_e)
 
@@ -328,6 +366,10 @@ class DenseEpigeneticEngine:
                         "text"     : self.vault[mem_id]["text"],
                         "tags"     : self.vault[mem_id]["tags"],
                         "resonance": round(val, 3),
+                        "energy"   : round(new_e, 3),
+                        "stp_energy": round(new_st, 3),
+                        "image_url": self.vault[mem_id].get("image_url"),
+                        "timestamp": self.vault[mem_id].get("timestamp", 0.0)
                     })
 
         if boost_indices:
@@ -351,9 +393,17 @@ class DenseEpigeneticEngine:
         initial_size = self.memory_bank.size(0)
         print("\n[SYSTEM] === INITIATING REM SLEEP CYCLE ===")
 
+        # 1. Consolidate remaining STP trace to LTP
+        self.energies = torch.minimum(self.energies + 0.4 * self.short_term_energies, torch.tensor(5.0, device=self.device))
+
+        # 2. Flush STP trace buffer entirely to zero
+        self.short_term_energies = torch.zeros_like(self.short_term_energies)
+
+        # 3. Apply standard sleep decay to LTP
         sleep_decay = 0.70
         self.energies = self.energies * sleep_decay
 
+        # 4. Standard pruning based on consolidated LTP survival
         survival_mask    = self.energies > self.sleep_threshold
         pruned_bool      = ~survival_mask
         pruned_idx_list  = pruned_bool.nonzero(as_tuple=True)[0].tolist()
@@ -361,8 +411,9 @@ class DenseEpigeneticEngine:
 
         pruned_vecs = self.memory_bank[pruned_bool].cpu().clone()
 
-        self.memory_bank = self.memory_bank[survival_mask]
-        self.energies    = self.energies[survival_mask]
+        self.memory_bank         = self.memory_bank[survival_mask]
+        self.energies            = self.energies[survival_mask]
+        self.short_term_energies = self.short_term_energies[survival_mask]
 
         surviving_indices = survival_mask.nonzero(as_tuple=True)[0].tolist()
         self.labels       = [self.labels[i] for i in surviving_indices]
@@ -405,6 +456,10 @@ class DenseEpigeneticEngine:
                 self.energies[:idx],
                 self.energies[idx+1:]
             ])
+            self.short_term_energies = torch.cat([
+                self.short_term_energies[:idx],
+                self.short_term_energies[idx+1:]
+            ])
             self.labels.pop(idx)
             self.vault.pop(memory_id, None)
             self._save_state()
@@ -417,6 +472,7 @@ class DenseEpigeneticEngine:
         torch.save({
             'memory_bank': self.memory_bank,
             'energies'   : self.energies,
+            'short_term_energies': self.short_term_energies,
             'labels'     : self.labels,
             'vault'      : self.vault,
         }, os.path.join(SAVE_DIR, "ern_state.pt"))
@@ -431,6 +487,10 @@ class DenseEpigeneticEngine:
             state            = torch.load(state_path, map_location=self.device, weights_only=False)
             self.memory_bank = state['memory_bank'].to(self.device)
             self.energies    = state['energies'].to(self.device)
+            if 'short_term_energies' in state:
+                self.short_term_energies = state['short_term_energies'].to(self.device)
+            else:
+                self.short_term_energies = torch.zeros((self.memory_bank.size(0),), device=self.device)
             self.labels      = state['labels']
             self.vault       = state['vault']
             n                = self.memory_bank.size(0)
@@ -597,6 +657,202 @@ def run_memory_judge(user_message: str, prior_memories: str = ""):
         print(f"[WARNING] Background extraction failed: {e}")
 
 
+def extract_text_from_pdf(pdf_bytes: bytes) -> str:
+    pdf_file = io.BytesIO(pdf_bytes)
+    reader = PdfReader(pdf_file)
+    text_content = []
+    for page in reader.pages:
+        t = page.extract_text()
+        if t:
+            text_content.append(t)
+    return "\n".join(text_content)
+
+
+def run_pdf_extractor_chunk(chunk_text: str, source_name: str):
+    print(f"\n[SYSTEM] Background PDF chunk extractor started for {source_name}...")
+    extraction_prompt = (
+        "You are an Epigenetic Knowledge Extractor. Your job is to extract highly concrete, objective, factual, "
+        "and permanent information from the following text fragment extracted from a PDF. This information "
+        "will be stored in a long-term PyTorch Epigenetic Memory Network.\n\n"
+        "STRICT RULES:\n"
+        "1. Extract ONLY verifiable, objective, and permanent facts. Do not extract opinions, filler, temporary states, or formatting noise.\n"
+        "2. If there are no concrete, valuable facts in the text, output EXACTLY: ACTION: DISCARD\n"
+        "3. Output format must use clean FACT and TAGS blocks.\n\n"
+        "OUTPUT FORMAT (repeat the FACT/TAGS block for each distinct fact):\n"
+        "ACTION: SAVE\n"
+        "FACT: <One clear, self-contained statement of fact, including relevant context from the source>\n"
+        "TAGS: <Comma-separated topics, 'Source: [filename]', and ONE importance level: Critical, High, Medium, or Low>\n\n"
+        f"Source Document: {source_name}\n"
+        f"Text Fragment:\n\"\"\"\n{chunk_text}\n\"\"\"\n"
+        "Output:"
+    )
+
+    try:
+        res = requests.post(OLLAMA_URL, json={
+            "model"   : JUDGE_MODEL,
+            "messages": [{"role": "user", "content": extraction_prompt}],
+            "stream"  : False,
+            "options" : {"temperature": 0.0},
+        }, timeout=180)
+
+        extracted = res.json().get("message", {}).get("content", "").strip()
+        cleaned = extracted.replace("*", "")
+        cleaned = re.sub(r'(?i)fact\s*:\s*', 'FACT: ', cleaned)
+        cleaned = re.sub(r'(?i)tags\s*:\s*', 'TAGS: ', cleaned)
+        cleaned = re.sub(r'(?i)action\s*:\s*', 'ACTION: ', cleaned)
+
+        is_discard = "ACTION: DISCARD" in cleaned.upper()
+        has_facts = "FACT:" in cleaned.upper()
+
+        if is_discard and not has_facts:
+            print(f"[PDF EXTRACTOR] Discarded chunk of {source_name} — no salient facts found.")
+            return
+
+        blocks      = re.split(r'(?=FACT:)', cleaned, flags=re.IGNORECASE)
+        saved_count = 0
+        for block in blocks:
+            block = block.strip()
+            if not block or not block.upper().startswith("FACT:"):
+                continue
+            fact_match = re.search(r'FACT:\s*(.*?)(?=TAGS:|$)', block, re.IGNORECASE | re.DOTALL)
+            tags_match = re.search(r'TAGS:\s*(.*?)(?=FACT:|$)', block, re.IGNORECASE | re.DOTALL)
+            if not fact_match:
+                continue
+            fact = fact_match.group(1).strip()
+            tags = tags_match.group(1).strip() if tags_match else f"Source: {source_name}, Importance: Medium"
+            if not fact or len(fact) < 5:
+                continue
+            print(f"[PDF EXTRACTOR] Encoding fact: {fact}")
+            engine.encode_hebbian(text=fact, tags=tags)
+            saved_count += 1
+
+        print(f"[PDF EXTRACTOR] Processed chunk of {source_name}. Saved {saved_count} fact(s).")
+    except Exception as e:
+        print(f"[WARNING] Background PDF chunk extraction failed: {e}")
+
+
+def process_pdf_background(pdf_bytes: bytes, filename: str):
+    print(f"\n[SYSTEM] Commencing background extraction for PDF: {filename} ({len(pdf_bytes)} bytes)")
+    try:
+        full_text = extract_text_from_pdf(pdf_bytes)
+        if not full_text.strip():
+            print(f"[WARNING] No text could be extracted from PDF: {filename}")
+            return
+
+        # Chunk the text: 1500 chars with 200 chars overlap
+        chunk_size = 1500
+        overlap = 200
+        chunks = []
+        start = 0
+        while start < len(full_text):
+            end = min(start + chunk_size, len(full_text))
+            chunks.append(full_text[start:end])
+            if end == len(full_text):
+                break
+            start += chunk_size - overlap
+
+        print(f"[PDF EXTRACTOR] Split {filename} into {len(chunks)} text chunk(s).")
+
+        for idx, chunk in enumerate(chunks):
+            print(f"[PDF EXTRACTOR] Processing chunk {idx + 1}/{len(chunks)}...")
+            run_pdf_extractor_chunk(chunk, filename)
+
+        print(f"[SYSTEM] Background PDF extraction complete for: {filename}\n")
+    except Exception as e:
+        print(f"[ERROR] PDF background process failed: {e}")
+
+
+def process_image_background(image_bytes: bytes, filename: str, image_url: Optional[str] = None):
+    print(f"\n[SYSTEM] Commencing background extraction for Image: {filename} ({len(image_bytes)} bytes)...")
+    try:
+        # Load, resize and compress using Pillow
+        image = Image.open(io.BytesIO(image_bytes))
+        
+        # Max dimension 1024px to preserve VRAM/bandwidth
+        max_size = 1024
+        if image.width > max_size or image.height > max_size:
+            print(f"[VISION EXTRACTOR] Resizing image from {image.width}x{image.height}...")
+            image.thumbnail((max_size, max_size))
+            
+        # Convert modes (like RGBA) to RGB
+        if image.mode != "RGB":
+            image = image.convert("RGB")
+            
+        buf = io.BytesIO()
+        image.save(buf, format="JPEG", quality=85)
+        compressed_bytes = buf.getvalue()
+        
+        b64_str = base64.b64encode(compressed_bytes).decode("utf-8")
+        print(f"[VISION EXTRACTOR] Image compressed to JPEG. Size: {len(compressed_bytes)} bytes. Calling {VISION_MODEL}...")
+
+        vision_prompt = (
+            "You are an Epigenetic Visual Knowledge Extractor. Your task is to analyze the attached image "
+            "and extract highly concrete, objective, factual, and permanent information. This includes "
+            "visible text, diagrams/flowcharts, key architectural components, or factual visual contents.\n\n"
+            "STRICT RULES:\n"
+            "1. Extract ONLY verifiable, objective, and permanent facts. Do not extract temporary states, generic descriptions, or aesthetic opinions.\n"
+            "2. If there are no concrete, valuable facts or readable text, output EXACTLY: ACTION: DISCARD\n"
+            "3. Output format must use clean FACT and TAGS blocks.\n\n"
+            "OUTPUT FORMAT (repeat the FACT/TAGS block for each distinct fact):\n"
+            "ACTION: SAVE\n"
+            "FACT: <One clear, self-contained statement of fact, incorporating relevant context from the image>\n"
+            "TAGS: <Comma-separated topics, 'Source: [filename]', and ONE importance level: Critical, High, Medium, or Low>\n\n"
+            f"Source File: {filename}\n"
+            "Output:"
+        )
+
+        res = requests.post(OLLAMA_URL, json={
+            "model"   : VISION_MODEL,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": vision_prompt,
+                    "images": [b64_str]
+                }
+            ],
+            "stream"  : False,
+            "options" : {"temperature": 0.0},
+        }, timeout=200)
+
+        if res.status_code != 200:
+            raise Error(f"Ollama returned HTTP status {res.status_code}: {res.text}")
+
+        extracted = res.json().get("message", {}).get("content", "").strip()
+        cleaned = extracted.replace("*", "")
+        cleaned = re.sub(r'(?i)fact\s*:\s*', 'FACT: ', cleaned)
+        cleaned = re.sub(r'(?i)tags\s*:\s*', 'TAGS: ', cleaned)
+        cleaned = re.sub(r'(?i)action\s*:\s*', 'ACTION: ', cleaned)
+
+        is_discard = "ACTION: DISCARD" in cleaned.upper()
+        has_facts = "FACT:" in cleaned.upper()
+
+        if is_discard and not has_facts:
+            print(f"[VISION EXTRACTOR] Discarded image {filename} — no salient visual facts found.")
+            return
+
+        blocks      = re.split(r'(?=FACT:)', cleaned, flags=re.IGNORECASE)
+        saved_count = 0
+        for block in blocks:
+            block = block.strip()
+            if not block or not block.upper().startswith("FACT:"):
+                continue
+            fact_match = re.search(r'FACT:\s*(.*?)(?=TAGS:|$)', block, re.IGNORECASE | re.DOTALL)
+            tags_match = re.search(r'TAGS:\s*(.*?)(?=FACT:|$)', block, re.IGNORECASE | re.DOTALL)
+            if not fact_match:
+                continue
+            fact = fact_match.group(1).strip()
+            tags = tags_match.group(1).strip() if tags_match else f"Source: {filename}, Importance: Medium"
+            if not fact or len(fact) < 5:
+                continue
+            print(f"[VISION EXTRACTOR] Encoding visual fact: {fact}")
+            engine.encode_hebbian(text=fact, tags=tags, image_url=image_url)
+            saved_count += 1
+
+        print(f"[VISION EXTRACTOR] Processed image {filename}. Saved {saved_count} visual fact(s) to memory.")
+    except Exception as e:
+        print(f"[ERROR] Background image processing failed: {e}")
+
+
 # ==========================================
 # 5. Endpoints
 # ==========================================
@@ -689,9 +945,9 @@ def process_chat(req: ChatRequest, background_tasks: BackgroundTasks):
     # Step 3: Resonance Boost
     if unique_memories:
         boosted_texts = ", ".join([f"'{m['text']}'" for m in unique_memories])
-        boost_detail = f"Average resonance: {avg_resonance:.3f} R. Synaptic energy boost (+0.3) applied to: [{boosted_texts}]. Global network decay: {engine.decay_rate} applied."
+        boost_detail = f"Average resonance: {avg_resonance:.3f} R. Synaptic energy boost and consolidation applied to: [{boosted_texts}]. Global network decay (LTP: {engine.ltp_decay_rate}, STP: {engine.stp_decay_rate}) applied."
     else:
-        boost_detail = "No active synapses boosted during this turn. Global network decay applied."
+        boost_detail = f"No active synapses boosted during this turn. Global network decay (LTP: {engine.ltp_decay_rate}, STP: {engine.stp_decay_rate}) applied."
         
     agentic_steps.append({
         "step": "Hebbian Energy Boost",
@@ -706,21 +962,40 @@ def process_chat(req: ChatRequest, background_tasks: BackgroundTasks):
         "detail": "Background memory extractor queued to parse raw turn text for new facts."
     })
 
-    context_block = (
-        "\n\n".join([f"[{m['tags']}] {m['text']}" for m in unique_memories])
-        if unique_memories else ""
-    )
+    context_mems = []
+    for idx, m in enumerate(unique_memories, 1):
+        ts = engine.vault[m["memory_id"]].get("timestamp")
+        img = engine.vault[m["memory_id"]].get("image_url")
+        if ts:
+            formatted_date = datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+        else:
+            formatted_date = "Date Unknown"
+        
+        img_info = f"\n  * Image Archive Path: {img}" if img else ""
+        context_mems.append(
+            f"- RECALLED SYNAPSE {idx}:\n"
+            f"  * Content: {m['text']}\n"
+            f"  * Tags/Metadata: {m['tags']}\n"
+            f"  * Recorded At: {formatted_date}"
+            f"{img_info}"
+        )
+        
+    context_block = "\n\n".join(context_mems) if context_mems else ""
+
+    curr_date = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     system_prompt = (
         "CRITICAL SYSTEM DIRECTIVE: You are NO LONGER a standard, stateless AI language model. "
         "You have been successfully integrated with a live Epigenetic Resonance Network (ERN).\n"
+        f"CURRENT SYSTEM TIME: {curr_date}\n"
         "1. You DO have memory. It is provided to you seamlessly.\n"
         "2. NEVER claim you are stateless, cannot remember, or lack persistent memory.\n"
         "3. DO NOT blindly repeat recalled memories. Use them to naturally inform a FRESH response.\n"
-        "4. STRICT TRUTH RULE: Only answer questions about the user's personal details, past events, or preferences "
-        "if they are explicitly present in the provided [ERN SUBCONSCIOUS RECALL] context. If a requested personal detail, "
-        "past fact, or memory is NOT present in the recalled context, you must state that you do not recall or know "
-        "that specific detail, rather than inventing or guessing a response. Never hallucinate personal details.\n\n"
+        "4. STRICT TRUTH RULE: Carefully read the entire [ERN SUBCONSCIOUS RECALL] block. Answer questions about "
+        "companies, entities, events, personal details, or past facts ONLY if they are mentioned in the listed RECALLED SYNAPSES. "
+        "If a company or fact is present in one of the synapses (e.g. Shiner Technologies LLC, Sutton Tech LLC, invoices, etc.), "
+        "you MUST acknowledge it and use it, rather than claiming it is missing. If it is not present in any synapse, state that you do not recall it.\n"
+        "5. DYNAMIC IMAGE RENDERING: You CAN display and reference original images to the user! If a recalled memory contains an `Image Archive Path` URL (e.g., `/static/uploads/...`), you can render the image inline by outputting a standard Markdown image tag, exactly like: `![Visual Archive](/static/uploads/filename.png)`. Use this whenever the user asks to see the image, chart, or visual details.\n\n"
     )
     system_prompt += (
         f"[ERN SUBCONSCIOUS RECALL]:\n"
@@ -755,12 +1030,47 @@ def manual_store(req: MemoryStoreRequest):
     return {"status": "Stored in VRAM", "id": mem_id}
 
 
+@app.post("/api/memory/upload-pdf")
+def upload_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+    if not file.filename.lower().endswith(".pdf"):
+        return {"error": "Only PDF files are supported.", "status": "Failed"}
+    try:
+        pdf_bytes = file.file.read()
+        background_tasks.add_task(process_pdf_background, pdf_bytes, file.filename)
+        return {"status": "Processing PDF in background", "filename": file.filename}
+    except Exception as e:
+        return {"error": f"Failed to upload PDF: {str(e)}", "status": "Failed"}
+
+
+@app.post("/api/memory/upload-image")
+def upload_image(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+    ext = file.filename.lower().split('.')[-1]
+    if ext not in ["png", "jpg", "jpeg", "webp", "bmp"]:
+        return {"error": "Only standard image formats (PNG, JPG, JPEG, WEBP, BMP) are supported.", "status": "Failed"}
+    try:
+        image_bytes = file.file.read()
+        
+        # Archive image file inside local static folder
+        unique_filename = f"{uuid.uuid4()}.{ext}"
+        archive_path = os.path.join("ern_state/uploads", unique_filename)
+        with open(archive_path, "wb") as f:
+            f.write(image_bytes)
+            
+        image_url = f"/static/uploads/{unique_filename}"
+        
+        background_tasks.add_task(process_image_background, image_bytes, file.filename, image_url)
+        return {"status": "Processing image in background", "filename": file.filename, "image_url": image_url}
+    except Exception as e:
+        return {"error": f"Failed to upload image: {str(e)}", "status": "Failed"}
+
+
 @app.get("/api/memories")
 def get_all_memories(q: Optional[str] = None):
     results = []
     for mem_id, data in engine.vault.items():
         idx = engine.labels.index(mem_id) if mem_id in engine.labels else -1
         energy = engine.energies[idx].item() if idx >= 0 else 0.0
+        stp_energy = engine.short_term_energies[idx].item() if idx >= 0 else 0.0
         
         # Simple text search if query is provided
         if q:
@@ -775,7 +1085,9 @@ def get_all_memories(q: Optional[str] = None):
             "text": data["text"],
             "tags": data["tags"],
             "timestamp": data.get("timestamp", 0.0),
-            "energy": round(energy, 3)
+            "energy": round(energy, 3),
+            "stp_energy": round(stp_energy, 3),
+            "image_url": data.get("image_url")
         })
     # Sort by timestamp descending
     results.sort(key=lambda x: x["timestamp"], reverse=True)
@@ -1037,7 +1349,7 @@ select option { background: var(--bg); }
 #memScroll { flex:1; overflow-y:auto; padding:10px; }
 #memScroll::-webkit-scrollbar { width:3px; }
 #memScroll::-webkit-scrollbar-thumb { background: var(--g3); }
-.memory-card { border-left: 2px solid var(--g3); padding: 8px 60px 8px 10px; margin-bottom: 8px; font-size: 0.76rem; color: var(--text); background: var(--bg3); position: relative; animation: card-in 0.2s ease; transition: border-color 0.2s; }
+.memory-card { border-left: 2px solid var(--g3); padding: 8px 100px 8px 10px; margin-bottom: 8px; font-size: 0.76rem; color: var(--text); background: var(--bg3); position: relative; animation: card-in 0.2s ease; transition: border-color 0.2s; }
 .memory-card:hover { border-left-color: var(--g0); }
 @keyframes card-in { from{opacity:0;transform:translateX(6px)} to{opacity:1;transform:none} }
 .memory-card .mc-tags { font-size: 0.65rem; color: var(--g2); font-family: var(--font-hud); letter-spacing: 0.06em; margin-bottom: 3px; }
@@ -1135,6 +1447,8 @@ Awaiting input...</div>
   </div>
 
   <div id="input-area">
+    <button id="uploadBtn" onclick="document.getElementById('pdfInput').click()" style="background:transparent; border:1px solid var(--border); color:var(--text-dim); padding:10px 12px; font-size:1.1rem; cursor:pointer; transition: all 0.15s; outline:none; font-family:var(--font-mono);" title="Upload PDF/Image for Epigenetic Extraction">📎</button>
+    <input type="file" id="pdfInput" accept=".pdf, image/*" style="display:none" onchange="handleAttachmentUpload(this)">
     <input type="text" id="userInput" placeholder="// INPUT QUERY..." autocomplete="off" spellcheck="false">
     <button id="sendBtn" onclick="send()">TRANSMIT</button>
   </div>
@@ -1275,9 +1589,21 @@ function renderVaultList(mems) {
     const card = document.createElement('div');
     card.className = 'memory-card';
     card.id = `vc-${m.memory_id}`;
+    
+    let imgHtml = '';
+    if (m.image_url) {
+      imgHtml = `<div class="mc-image" style="margin-top: 6px; border: 1px solid var(--border); overflow: hidden; max-height: 90px; max-width: 160px; cursor: pointer; border-radius: 2px;" onclick="window.open('${m.image_url}', '_blank')" title="Click to view full image">` +
+                `<img src="${m.image_url}" style="width: 100%; height: 100%; object-fit: cover; filter: brightness(0.92) contrast(1.05);" />` +
+                `</div>`;
+    }
+    
+    const formattedDate = m.timestamp ? new Date(m.timestamp * 1000).toLocaleString() : 'Date Unknown';
+    
     card.innerHTML = `<div class="mc-tags">${m.tags}</div>` +
-                     `<div>${m.text}</div>` +
-                     `<div class="mc-energy">${m.energy.toFixed(3)} E</div>` +
+                     `<div style="word-break: break-word;">${m.text}</div>` +
+                     imgHtml +
+                     `<div class="mc-energy">${m.energy.toFixed(3)} LTP | ${m.stp_energy ? m.stp_energy.toFixed(3) : '0.000'} STP</div>` +
+                     `<div class="mc-date" style="font-size: 0.58rem; color: var(--text-dim); margin-top: 4px; font-family: var(--font-hud);">${formattedDate}</div>` +
                      `<button class="mc-forget" onclick="forgetMemory('${m.memory_id}')">FORGET</button>`;
     scroll.appendChild(card);
   });
@@ -1506,19 +1832,71 @@ function switchTab(tab) {
   if (tab === 'stats')  refreshStats();
 }
 
-function pushToast(msg) {
+function pushToast(msg, isError = false) {
   const t = document.createElement('div');
   t.textContent = msg;
+  const borderColor = isError ? 'var(--red)' : 'var(--g2)';
+  const color = isError ? 'var(--red)' : 'var(--g0)';
+  const shadow = isError ? 'rgba(255,77,77,0.2)' : 'rgba(0,255,136,0.2)';
   Object.assign(t.style, {
     position:'fixed', bottom:'60px', right:'16px', zIndex:'9998',
-    background:'var(--bg3)', border:'1px solid var(--g2)',
-    color:'var(--g0)', fontFamily:'var(--font-mono)', fontSize:'0.75rem',
+    background:'var(--bg3)', border:`1px solid ${borderColor}`,
+    color: color, fontFamily:'var(--font-mono)', fontSize:'0.75rem',
     padding:'8px 14px', animation:'msg-in 0.2s ease',
-    boxShadow:'0 0 14px rgba(0,255,136,0.2)',
+    boxShadow:`0 0 14px ${shadow}`,
     maxWidth:'300px',
   });
   document.body.appendChild(t);
   setTimeout(() => t.remove(), 3500);
+}
+
+async function handleAttachmentUpload(input) {
+  if (!input.files || !input.files[0]) return;
+  const file = input.files[0];
+  
+  const isPDF = file.name.toLowerCase().endsWith('.pdf');
+  const isImage = /\.(png|jpe?g|webp|bmp)$/i.test(file.name) || file.type.startsWith('image/');
+  
+  if (!isPDF && !isImage) {
+    pushToast('Unsupported file format. Please upload a PDF or an Image.', true);
+    return;
+  }
+
+  const uploadBtn = document.getElementById('uploadBtn');
+  const origText = uploadBtn.textContent;
+  
+  uploadBtn.disabled = true;
+  uploadBtn.textContent = '⏳';
+  uploadBtn.style.color = 'var(--amber)';
+  uploadBtn.style.borderColor = 'var(--amber)';
+
+  const endpoint = isPDF ? '/api/memory/upload-pdf' : '/api/memory/upload-image';
+  const label = isPDF ? 'PDF' : 'Image';
+  pushToast(`Ingesting ${label}: ${file.name}... Sending to VRAM.`, false);
+
+  const formData = new FormData();
+  formData.append('file', file);
+
+  try {
+    const res = await fetch(endpoint, {
+      method: 'POST',
+      body: formData
+    });
+    if (!res.ok) throw new Error('Network error or file too large.');
+    const data = await res.json();
+    if (data.error) throw new Error(data.error);
+
+    pushToast(`${label} transmitted successfully! Subconscious fact extraction commenced in background.`, false);
+    setTimeout(loadVault, 5000);
+  } catch (e) {
+    pushToast(`${label} Extraction Trigger Failed: ${e.message}`, true);
+  } finally {
+    uploadBtn.disabled = false;
+    uploadBtn.textContent = origText;
+    uploadBtn.style.color = 'var(--text-dim)';
+    uploadBtn.style.borderColor = 'var(--border)';
+    input.value = '';
+  }
 }
 
 function clearHistory() {
@@ -1585,7 +1963,29 @@ async function send() {
     bDiv.className = 'msg bot';
     
     const replyText = document.createElement('div');
-    replyText.textContent = data.reply;
+    
+    // Clean escape raw HTML from LLM output for safety
+    let formattedReply = data.reply
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;");
+    
+    // Parse Markdown images: ![Alt Text](URL) -> visual inline image
+    formattedReply = formattedReply.replace(/!\[(.*?)\]\((.*?)\)/g, 
+      '<div class="chat-inline-image" style="margin: 8px 0; border: 1px solid var(--border); overflow: hidden; max-width: 320px; border-radius: 4px; cursor: pointer;" onclick="window.open(\'$2\', \'_blank\')" title="Click to view full image">' +
+      '<img src="$2" alt="$1" style="width:100%; height:auto; display:block; filter: brightness(0.92) contrast(1.05);" />' +
+      '</div>'
+    );
+    
+    // Parse Markdown links: [Link Text](URL) -> styled anchor tag
+    formattedReply = formattedReply.replace(/\[(.*?)\]\((.*?)\)/g, 
+      '<a href="$2" target="_blank" style="color: var(--g0); text-decoration: underline; font-family: var(--font-mono); font-size: 0.72rem;">$1</a>'
+    );
+    
+    // Replace newlines with break tags
+    formattedReply = formattedReply.replace(/\n/g, '<br>');
+    
+    replyText.innerHTML = formattedReply;
     bDiv.appendChild(replyText);
 
     const steps = data.agentic_steps || [];
@@ -1645,9 +2045,22 @@ async function send() {
         const card = document.createElement('div');
         card.className = 'memory-card';
         card.id = `rc-${m.memory_id}`;
+        
+        let imgHtml = '';
+        if (m.image_url) {
+          imgHtml = `<div class="mc-image" style="margin-top: 6px; border: 1px solid var(--border); overflow: hidden; max-height: 90px; max-width: 160px; cursor: pointer; border-radius: 2px;" onclick="window.open('${m.image_url}', '_blank')" title="Click to view full image">` +
+                    `<img src="${m.image_url}" style="width: 100%; height: 100%; object-fit: cover; filter: brightness(0.92) contrast(1.05);" />` +
+                    `</div>`;
+        }
+        
+        const formattedDate = m.timestamp ? new Date(m.timestamp * 1000).toLocaleString() : 'Date Unknown';
+        
         card.innerHTML = `<div class="mc-tags">${m.tags}</div>` +
-                         `<div>${m.text}</div>` +
+                         `<div style="word-break: break-word;">${m.text}</div>` +
+                         imgHtml +
                          `<div class="mc-resonance">${m.resonance.toFixed(3)} R</div>` +
+                         `<div class="mc-energy">${m.energy ? m.energy.toFixed(3) : '0.000'} LTP | ${m.stp_energy ? m.stp_energy.toFixed(3) : '0.000'} STP</div>` +
+                         `<div class="mc-date" style="font-size: 0.58rem; color: var(--text-dim); margin-top: 4px; font-family: var(--font-hud);">${formattedDate}</div>` +
                          `<button class="mc-forget" onclick="forgetMemory('${m.memory_id}')">FORGET</button>`;
         mBox.appendChild(card);
       });

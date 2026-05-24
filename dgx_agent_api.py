@@ -48,6 +48,11 @@ app.add_middleware(
 
 # Configure and mount local image archiving folders
 os.makedirs("ern_state/uploads", exist_ok=True)
+try:
+    os.chmod("ern_state", 0o777)
+    os.chmod("ern_state/uploads", 0o777)
+except Exception:
+    pass
 app.mount("/static", StaticFiles(directory="ern_state"), name="static")
 
 @app.post("/api/chat", response_model=ChatResponse)
@@ -399,6 +404,10 @@ def upload_image(background_tasks: BackgroundTasks, file: UploadFile = File(...)
         archive_path = os.path.join("ern_state/uploads", unique_filename)
         with open(archive_path, "wb") as f:
             f.write(image_bytes)
+        try:
+            os.chmod(archive_path, 0o666)
+        except Exception:
+            pass
             
         image_url = f"/static/uploads/{unique_filename}"
         

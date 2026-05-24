@@ -278,6 +278,10 @@ class ERNModule:
 
     def _save_state(self):
         os.makedirs(self.module_dir, exist_ok=True)
+        try:
+            os.chmod(self.module_dir, 0o777)
+        except Exception:
+            pass
         torch.save({
             'memory_bank': self.memory_bank,
             'energies'   : self.energies,
@@ -286,6 +290,11 @@ class ERNModule:
             'vault'      : self.vault,
         }, self.state_path)
         self.deltas.save(self.delta_path)
+        try:
+            os.chmod(self.state_path, 0o666)
+            os.chmod(self.delta_path, 0o666)
+        except Exception:
+            pass
 
     def _load_state(self):
         self.deltas.load(self.delta_path)
@@ -316,6 +325,10 @@ class ERNModuleManager:
         self.save_dir = save_dir
         self.modules_dir = os.path.join(save_dir, "modules")
         os.makedirs(self.modules_dir, exist_ok=True)
+        try:
+            os.chmod(self.modules_dir, 0o777)
+        except Exception:
+            pass
         self.registry_path = os.path.join(self.modules_dir, "registry.json")
         
         self.device = _resolve_device()
@@ -383,6 +396,10 @@ class ERNModuleManager:
         try:
             with open(self.registry_path, "w") as f:
                 json.dump(registry, f, indent=2)
+            try:
+                os.chmod(self.registry_path, 0o666)
+            except Exception:
+                pass
         except Exception as e:
             print(f"[ERROR] Failed to write registry: {e}")
 

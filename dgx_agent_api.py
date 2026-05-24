@@ -290,6 +290,12 @@ class ERNModule:
         self.deltas = TensorDeltaStack(max_len=10_000)
         self._load_state()
 
+        # Pre-compute static description embedding for vector routing
+        desc_text = f"ID: {self.module_id} | Name: {self.name} | Description: {self.description}"
+        with torch.no_grad():
+            desc_emb = self.embedder.encode(desc_text, convert_to_tensor=True, device=self.device)
+        self.description_vector = F.normalize(desc_emb, p=2, dim=0)
+
     def _encode(self, text: str) -> torch.Tensor:
         with torch.no_grad():
             vec = self.embedder.encode(text, convert_to_tensor=True, device=self.device)
@@ -297,6 +303,13 @@ class ERNModule:
 
     def _now(self) -> float:
         return time.time()
+
+    def get_dynamic_centroid(self) -> Optional[torch.Tensor]:
+        if self.memory_bank.size(0) > 0:
+            with torch.no_grad():
+                centroid = torch.mean(self.memory_bank, dim=0)
+                return F.normalize(centroid, p=2, dim=0)
+        return None
 
     def encode_hebbian(self, text: str, tags: str, image_url: Optional[str] = None, memory_type: str = "fact") -> str:
         memory_id = str(uuid.uuid4())
@@ -703,7 +716,7 @@ manager = ERNModuleManager()
 
 
 def route_query_to_modules(user_message: str, available_modules: List[Dict[str, Any]]) -> List[str]:
-    print("\n[SYSTEM] Commencing dynamic cognitive routing...")
+    print("\n[SYSTEM] Commencing dynamic hybrid cognitive routing...")
     
     # Exclude frozen modules and default-memory from routing candidates
     routable = [m for m in available_modules if not m["config"].get("frozen", False) and m["config"]["module_id"] != "default-memory"]
@@ -716,51 +729,85 @@ def route_query_to_modules(user_message: str, available_modules: List[Dict[str, 
         modules_desc.append(f"- ID: '{config['module_id']}' | Name: '{config['name']}' | Description: '{config['description']}'")
         
     modules_str = "\n".join(modules_desc)
-    valid_ids = [m["config"]["module_id"] for m in routable]
     
-    routing_prompt = (
-        "You are an Epigenetic Memory Router. Select which memory module IDs to query for the user's message.\n\n"
-        "AVAILABLE MODULES:\n"
+    reformulation_prompt = (
+        "You are an expert search query translator for a Mixture of Experts semantic memory system.\n"
+        "Your task is to take the user's casual conversation prompt and translate/expand it into a highly descriptive search query "
+        "specifically optimized to match the target memory module definitions.\n\n"
+        "AVAILABLE MODULE EXPERTISE CATEGORIES:\n"
         f"{modules_str}\n\n"
-        "RULES:\n"
-        "1. Output ONLY a comma-separated list of module IDs from the list above. Nothing else.\n"
-        "2. Pick modules whose description matches the topic of the user's message.\n"
-        "3. If nothing matches or it is a greeting, output exactly: NONE\n"
-        "4. Do NOT include quotes, explanations, or any other text.\n\n"
-        f"Valid IDs: {', '.join(valid_ids)}\n"
-        f"User: {user_message}\n"
-        "Output:"
+        "INSTRUCTIONS:\n"
+        "1. Write an optimized search query using specialized keywords, technical terms, and semantic concepts aligned with the target modules.\n"
+        "2. Keep the output extremely short (under 12 words) containing ONLY the target query. Do not write 'Query:', do not explain.\n\n"
+        f"User Message: {user_message}\n"
+        "Optimized Target Query:"
     )
     
     try:
         res = requests.post(OLLAMA_URL, json={
             "model"   : JUDGE_MODEL,
-            "messages": [{"role": "user", "content": routing_prompt}],
+            "messages": [{"role": "user", "content": reformulation_prompt}],
             "stream"  : False,
-            "options" : {"temperature": 0.0, "num_predict": 60},
-        }, timeout=20)
+            "options" : {"temperature": 0.0, "num_predict": 40},
+        }, timeout=10)
         
-        output = res.json().get("message", {}).get("content", "").strip()
-        # Strip markdown, quotes, backticks
-        output = re.sub(r'[`*"\']', '', output).strip()
-        print(f"[ROUTER] Raw output: '{output}'")
-        
-        if not output or "NONE" in output.upper():
-            return ["default-memory"]
-            
-        raw_ids = [idx.strip() for idx in re.split(r'[,\s]+', output) if idx.strip()]
-        selected_ids = [rid for rid in raw_ids if rid in valid_ids]
-        
-        if not selected_ids:
-            print(f"[ROUTER] No valid IDs parsed from '{output}', using default-memory.")
-            return ["default-memory"]
-
-        print(f"[ROUTER] Selected modules: {selected_ids}")
-        return selected_ids
-
+        opt_query = res.json().get("message", {}).get("content", "").strip()
+        opt_query = re.sub(r'[`*"\']', '', opt_query).strip()
+        print(f"[ROUTER] Reformulated Query: '{opt_query}'")
     except Exception as e:
-        print(f"[ROUTER] Failed ({e}), using default-memory.")
+        print(f"[ROUTER] Reformulation failed ({e}). Falling back to raw message.")
+        opt_query = user_message
+
+    # 2. Vector Semantic Routing against Static Descriptions & Dynamic Centroids
+    default_mod = manager.get_module("default-memory")
+    if not default_mod:
         return ["default-memory"]
+        
+    with torch.no_grad():
+        query_emb = default_mod.embedder.encode(opt_query, convert_to_tensor=True, device=default_mod.device)
+        query_emb = F.normalize(query_emb, p=2, dim=0)
+
+    selected_ids = []
+    routing_scores = {}
+    
+    for m in routable:
+        mid = m["config"]["module_id"]
+        mod_obj = manager.get_module(mid)
+        if not mod_obj:
+            continue
+            
+        # A. Static Description Similarity
+        desc_vec = mod_obj.description_vector.to(query_emb.device)
+        static_sim = torch.dot(query_emb, desc_vec).item()
+        
+        # B. Dynamic Centroid Similarity
+        centroid = mod_obj.get_dynamic_centroid()
+        if centroid is not None:
+            centroid = centroid.to(query_emb.device)
+            dynamic_sim = torch.dot(query_emb, centroid).item()
+        else:
+            dynamic_sim = 0.0
+            
+        # Fusion: Take maximum of static or dynamic similarity
+        combined_score = max(static_sim, dynamic_sim)
+        routing_scores[mid] = {
+            "static": round(static_sim, 3),
+            "dynamic": round(dynamic_sim, 3),
+            "combined": round(combined_score, 3)
+        }
+        
+        # Routing Decision: Threshold-based matching (e.g. 0.38)
+        if combined_score >= 0.38:
+            selected_ids.append(mid)
+
+    print(f"[ROUTER] Dynamic Hybrid Routing Analysis: {routing_scores}")
+    
+    if not selected_ids:
+        print("[ROUTER] No module scored above threshold. Routing to default-memory.")
+        return ["default-memory"]
+        
+    print(f"[ROUTER] Dynamically routed to: {selected_ids}")
+    return selected_ids
 
 
 # ==========================================

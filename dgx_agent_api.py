@@ -55,6 +55,8 @@ class ChatRequest(BaseModel):
     history: List[Message] = []
     focus_threshold: float = 0.15
     agentic_search: bool = True
+    pipeline: Optional[List[str]] = None
+    auto_route: bool = False
 
 class ChatResponse(BaseModel):
     reply: str
@@ -65,6 +67,22 @@ class ChatResponse(BaseModel):
 class MemoryStoreRequest(BaseModel):
     text: str
     tags: str = ""
+
+class ModuleConfig(BaseModel):
+    module_id: str
+    name: str
+    description: str = ""
+    frozen: bool = False
+    ltp_decay_rate: float = 0.95
+    stp_decay_rate: float = 0.80
+    sleep_threshold: float = 0.10
+    focus_threshold: float = 0.15
+    system_directive: str = ""
+
+class ModulePatchRequest(BaseModel):
+    frozen: Optional[bool] = None
+    ltp_decay_rate: Optional[float] = None
+    stp_decay_rate: Optional[float] = None
 
 # ==========================================
 # 2. Tensor Delta Stack
@@ -155,7 +173,7 @@ class TensorDeltaStack:
             self.stack = torch.load(path, map_location="cpu", weights_only=False)
             print(f"[DELTA STACK] Loaded {len(self.stack)} historical deltas.")
 
-    def rollback(self, engine: "DenseEpigeneticEngine", n: int = 1):
+    def rollback(self, engine: "ERNModule", n: int = 1):
         undone = 0
         new_stack = list(self.stack)
 
@@ -231,18 +249,27 @@ def _resolve_device() -> torch.device:
     return torch.device('cpu')
 
 
-class DenseEpigeneticEngine:
-    def __init__(self, model_name='all-MiniLM-L6-v2', device: str = 'auto'):
+class ERNModule:
+    def __init__(self, config: Dict[str, Any], model_name='all-MiniLM-L6-v2', device: str = 'auto', embedder: Optional[SentenceTransformer] = None):
+        self.module_id = config["module_id"]
+        self.name = config["name"]
+        self.description = config.get("description", "")
+        self.frozen = config.get("frozen", False)
+        
+        self.ltp_decay_rate = config.get("ltp_decay_rate", 0.95)
+        self.stp_decay_rate = config.get("stp_decay_rate", 0.80)
+        self.sleep_threshold = config.get("sleep_threshold", 0.1)
+        self.focus_threshold = config.get("focus_threshold", 0.15)
+        self.system_directive = config.get("system_directive", "")
+
         self.device = _resolve_device() if device == 'auto' else torch.device(device)
-        print(f"\n[HARDWARE] ERN Tensor Engine bound to: {self.device.type.upper()}")
-
-        if self.device.type == 'cuda':
-            print(f"[HARDWARE] GPU Detected: {torch.cuda.get_device_name(0)}")
+        
+        if embedder is not None:
+            self.embedder = embedder
         else:
-            print(f"[HARDWARE] Running on {self.device.type.upper()} — embeddings will be slower but fully functional.")
-
-        print(f"[SYSTEM] Loading Embedding Model: {model_name}...")
-        self.embedder = SentenceTransformer(model_name, device=self.device)
+            print(f"[SYSTEM] Loading Embedding Model: {model_name}...")
+            self.embedder = SentenceTransformer(model_name, device=self.device)
+            
         self.dim = self.embedder.get_sentence_embedding_dimension()
 
         self.memory_bank = torch.empty((0, self.dim), device=self.device)
@@ -251,10 +278,11 @@ class DenseEpigeneticEngine:
         self.labels: List[str] = []
         self.vault: Dict[str, Any] = {}
 
-        self.ltp_decay_rate  = 0.95
-        self.stp_decay_rate  = 0.80
-        self.sleep_threshold = 0.1
         self.query_count     = 0
+        self.module_dir = os.path.join(SAVE_DIR, "modules", self.module_id)
+        os.makedirs(self.module_dir, exist_ok=True)
+        self.state_path = os.path.join(self.module_dir, "ern_state.pt")
+        self.delta_path = os.path.join(self.module_dir, "ern_deltas.pt")
 
         self.deltas = TensorDeltaStack(max_len=10_000)
         self._load_state()
@@ -298,11 +326,11 @@ class DenseEpigeneticEngine:
         ))
 
         self._save_state()
-        print(f"[ERN] Synapse formed. Network size: {self.memory_bank.size(0)} nodes.")
+        print(f"[ERN][{self.name}] Synapse formed. Network size: {self.memory_bank.size(0)} nodes.")
         return memory_id
 
     def decay_energies(self):
-        if self.memory_bank.size(0) == 0:
+        if self.frozen or self.memory_bank.size(0) == 0:
             return
         prev_size = self.memory_bank.size(0)
         self.deltas.push(TensorDelta(
@@ -326,7 +354,7 @@ class DenseEpigeneticEngine:
         resonance    = similarities * (1.0 + torch.log1p(self.energies + self.short_term_energies))
 
         prev_size = self.memory_bank.size(0)
-        if decay:
+        if decay and not self.frozen:
             self.deltas.push(TensorDelta(
                 op           = DeltaOp.DECAY,
                 timestamp    = self._now(),
@@ -387,23 +415,18 @@ class DenseEpigeneticEngine:
         return results
 
     def sleep_cycle(self) -> int:
-        if self.memory_bank.size(0) == 0:
+        if self.frozen or self.memory_bank.size(0) == 0:
             return 0
 
         initial_size = self.memory_bank.size(0)
-        print("\n[SYSTEM] === INITIATING REM SLEEP CYCLE ===")
+        print(f"\n[SYSTEM][{self.name}] === INITIATING REM SLEEP CYCLE ===")
 
-        # 1. Consolidate remaining STP trace to LTP
         self.energies = torch.minimum(self.energies + 0.4 * self.short_term_energies, torch.tensor(5.0, device=self.device))
-
-        # 2. Flush STP trace buffer entirely to zero
         self.short_term_energies = torch.zeros_like(self.short_term_energies)
 
-        # 3. Apply standard sleep decay to LTP
         sleep_decay = 0.70
         self.energies = self.energies * sleep_decay
 
-        # 4. Standard pruning based on consolidated LTP survival
         survival_mask    = self.energies > self.sleep_threshold
         pruned_bool      = ~survival_mask
         pruned_idx_list  = pruned_bool.nonzero(as_tuple=True)[0].tolist()
@@ -435,17 +458,16 @@ class DenseEpigeneticEngine:
         ))
 
         self._save_state()
-        print(f"[SYSTEM] REM Complete. Scrubbed {pruned} weak nodes. Active: {self.memory_bank.size(0)}\n")
+        print(f"[SYSTEM][{self.name}] REM Complete. Scrubbed {pruned} weak nodes. Active: {self.memory_bank.size(0)}\n")
         return pruned
 
     def delete_memory(self, memory_id: str) -> bool:
         idx = self.labels.index(memory_id) if memory_id in self.labels else -1
         if idx >= 0:
-            state_path = os.path.join(SAVE_DIR, "ern_state.pt")
-            if os.path.exists(state_path):
+            if os.path.exists(self.state_path):
                 import shutil
                 try:
-                    shutil.copy2(state_path, state_path + ".bak")
+                    shutil.copy2(self.state_path, self.state_path + ".bak")
                 except Exception:
                     pass
             self.memory_bank = torch.cat([
@@ -463,28 +485,25 @@ class DenseEpigeneticEngine:
             self.labels.pop(idx)
             self.vault.pop(memory_id, None)
             self._save_state()
-            print(f"[ERN] Synapse {memory_id} forgotten. Network size: {self.memory_bank.size(0)} nodes.")
+            print(f"[ERN][{self.name}] Synapse {memory_id} forgotten. Network size: {self.memory_bank.size(0)} nodes.")
             return True
         return False
 
     def _save_state(self):
-        os.makedirs(SAVE_DIR, exist_ok=True)
+        os.makedirs(self.module_dir, exist_ok=True)
         torch.save({
             'memory_bank': self.memory_bank,
             'energies'   : self.energies,
             'short_term_energies': self.short_term_energies,
             'labels'     : self.labels,
             'vault'      : self.vault,
-        }, os.path.join(SAVE_DIR, "ern_state.pt"))
-        self.deltas.save(os.path.join(SAVE_DIR, "ern_deltas.pt"))
+        }, self.state_path)
+        self.deltas.save(self.delta_path)
 
     def _load_state(self):
-        state_path = os.path.join(SAVE_DIR, "ern_state.pt")
-        delta_path = os.path.join(SAVE_DIR, "ern_deltas.pt")
-        self.deltas.load(delta_path)
-
-        if os.path.exists(state_path):
-            state            = torch.load(state_path, map_location=self.device, weights_only=False)
+        self.deltas.load(self.delta_path)
+        if os.path.exists(self.state_path):
+            state            = torch.load(self.state_path, map_location=self.device, weights_only=False)
             self.memory_bank = state['memory_bank'].to(self.device)
             self.energies    = state['energies'].to(self.device)
             if 'short_term_energies' in state:
@@ -494,7 +513,7 @@ class DenseEpigeneticEngine:
             self.labels      = state['labels']
             self.vault       = state['vault']
             n                = self.memory_bank.size(0)
-            print(f"[SYSTEM] Restored ERN State: {n} existing synapses on {self.device.type.upper()}.")
+            print(f"[SYSTEM][{self.name}] Restored ERN State: {n} existing synapses on {self.device.type.upper()}.")
 
             self.deltas.push(TensorDelta(
                 op        = DeltaOp.RESTORE,
@@ -505,8 +524,224 @@ class DenseEpigeneticEngine:
             ))
 
 
-# Initialize global engine
-engine = DenseEpigeneticEngine(device='auto')
+class ERNModuleManager:
+    def __init__(self, save_dir: str = SAVE_DIR):
+        self.save_dir = save_dir
+        self.modules_dir = os.path.join(save_dir, "modules")
+        os.makedirs(self.modules_dir, exist_ok=True)
+        self.registry_path = os.path.join(self.modules_dir, "registry.json")
+        
+        self.device = _resolve_device()
+        print(f"[SYSTEM] Initializing shared sentence-transformer embedder...")
+        self.shared_embedder = SentenceTransformer('all-MiniLM-L6-v2', device=self.device)
+        
+        self.active_modules: Dict[str, ERNModule] = {}
+        
+        self._migrate_legacy_data()
+        self.registry = self._load_registry()
+        
+        # Pre-load default-memory module to ensure it's always ready
+        self.get_module("default-memory")
+
+    def _migrate_legacy_data(self):
+        legacy_state = os.path.join(self.save_dir, "ern_state.pt")
+        legacy_deltas = os.path.join(self.save_dir, "ern_deltas.pt")
+        default_mem_dir = os.path.join(self.modules_dir, "default-memory")
+        
+        if os.path.exists(legacy_state):
+            os.makedirs(default_mem_dir, exist_ok=True)
+            new_state_path = os.path.join(default_mem_dir, "ern_state.pt")
+            new_deltas_path = os.path.join(default_mem_dir, "ern_deltas.pt")
+            
+            if not os.path.exists(new_state_path):
+                print(f"[MIGRATION] Relocating legacy state {legacy_state} -> {new_state_path}")
+                import shutil
+                try:
+                    shutil.move(legacy_state, new_state_path)
+                    if os.path.exists(legacy_deltas):
+                        print(f"[MIGRATION] Relocating legacy deltas {legacy_deltas} -> {new_deltas_path}")
+                        shutil.move(legacy_deltas, new_deltas_path)
+                    print("[MIGRATION] Legacy data migration complete.")
+                except Exception as e:
+                    print(f"[ERROR] Migration failed: {e}")
+
+    def _load_registry(self) -> Dict[str, Any]:
+        import json
+        if os.path.exists(self.registry_path):
+            try:
+                with open(self.registry_path, "r") as f:
+                    return json.load(f)
+            except Exception as e:
+                print(f"[ERROR] Failed to load registry: {e}. Recreating default...")
+        
+        default_registry = {
+            "modules": {
+                "default-memory": {
+                    "module_id": "default-memory",
+                    "name": "Global Default Core",
+                    "description": "Baseline dynamic memory store containing primary historical facts.",
+                    "frozen": False,
+                    "ltp_decay_rate": 0.95,
+                    "stp_decay_rate": 0.80,
+                    "sleep_threshold": 0.10,
+                    "focus_threshold": 0.15,
+                    "system_directive": "Acknowledge baseline user-centric historical context when applicable."
+                }
+            },
+            "default_pipeline": ["default-memory"]
+        }
+        self._save_registry(default_registry)
+        return default_registry
+
+    def _save_registry(self, registry: Dict[str, Any]):
+        import json
+        try:
+            with open(self.registry_path, "w") as f:
+                json.dump(registry, f, indent=2)
+        except Exception as e:
+            print(f"[ERROR] Failed to write registry: {e}")
+
+    def get_module(self, module_id: str) -> Optional[ERNModule]:
+        if module_id in self.active_modules:
+            return self.active_modules[module_id]
+            
+        if module_id in self.registry["modules"]:
+            config = self.registry["modules"][module_id]
+            module = ERNModule(config, embedder=self.shared_embedder, device=self.device.type)
+            self.active_modules[module_id] = module
+            return module
+            
+        return None
+
+    def create_module(self, config: Dict[str, Any]) -> ERNModule:
+        module_id = config["module_id"]
+        self.registry["modules"][module_id] = config
+        self._save_registry(self.registry)
+        
+        module = ERNModule(config, embedder=self.shared_embedder, device=self.device.type)
+        self.active_modules[module_id] = module
+        print(f"[SYSTEM] Created module '{module.name}' successfully.")
+        return module
+
+    def delete_module(self, module_id: str) -> bool:
+        if module_id == "default-memory":
+            print("[WARNING] Cannot delete default-memory module.")
+            return False
+            
+        if module_id in self.registry["modules"]:
+            self.active_modules.pop(module_id, None)
+            self.registry["modules"].pop(module_id, None)
+            
+            if module_id in self.registry.get("default_pipeline", []):
+                self.registry["default_pipeline"].remove(module_id)
+            self._save_registry(self.registry)
+            
+            module_dir = os.path.join(self.modules_dir, module_id)
+            if os.path.exists(module_dir):
+                import shutil
+                try:
+                    shutil.rmtree(module_dir)
+                    print(f"[SYSTEM] Purged module {module_id} directory from disk.")
+                except Exception as e:
+                    print(f"[ERROR] Failed to remove directory for module {module_id}: {e}")
+            return True
+        return False
+
+    def list_modules(self) -> List[Dict[str, Any]]:
+        results = []
+        for m_id, config in self.registry["modules"].items():
+            loaded = m_id in self.active_modules
+            synapses_count = 0
+            if loaded:
+                synapses_count = self.active_modules[m_id].memory_bank.size(0)
+            else:
+                state_path = os.path.join(self.modules_dir, m_id, "ern_state.pt")
+                if os.path.exists(state_path):
+                    try:
+                        state = torch.load(state_path, map_location="cpu", weights_only=True)
+                        synapses_count = state['memory_bank'].size(0)
+                    except Exception:
+                        pass
+                        
+            results.append({
+                "config": config,
+                "loaded": loaded,
+                "synapses_count": synapses_count
+            })
+        return results
+
+    def sleep_all(self) -> Dict[str, int]:
+        results = {}
+        for m_id, config in self.registry["modules"].items():
+            if config.get("frozen", False):
+                continue
+            module = self.get_module(m_id)
+            if module:
+                pruned = module.sleep_cycle()
+                results[m_id] = pruned
+        return results
+
+
+# Initialize global module manager
+manager = ERNModuleManager()
+
+
+def route_query_to_modules(user_message: str, available_modules: List[Dict[str, Any]]) -> List[str]:
+    print("\n[SYSTEM] Commencing dynamic cognitive routing...")
+    
+    modules_desc = []
+    for m in available_modules:
+        config = m["config"]
+        modules_desc.append(f"- ID: '{config['module_id']}' | Name: '{config['name']}' | Description: '{config['description']}'")
+        
+    modules_str = "\n".join(modules_desc)
+    
+    routing_prompt = (
+        "You are the Epigenetic Memory Router Agent for a multi-module Mixture of Experts memory matrix.\n"
+        "Your task is to analyze the user's message and determine which memory modules are relevant and should be queried for context.\n\n"
+        "AVAILABLE MEMORY MODULES:\n"
+        f"{modules_str}\n\n"
+        "RULES:\n"
+        "1. Identify the module IDs that contain background context, guidelines, preferences, or history relevant to the User's message.\n"
+        "2. Output ONLY a comma-separated list of the relevant Module IDs, in order of query execution (from most relevant to least relevant).\n"
+        "3. If no modules are relevant, or it is a simple greeting/conversational phrase that doesn't need memory context, output exactly: NONE\n"
+        "4. Avoid adding any introductory, explanatory, or concluding text. Do not output anything except the IDs or NONE.\n\n"
+        "EXAMPLES:\n"
+        "User: How do I implement a standard Fast API router in our styling?\n"
+        "Output: coding-constitution, default-memory\n\n"
+        "User: Hello there, how are you today?\n"
+        "Output: NONE\n\n"
+        f"User: {user_message}\n"
+        "Output:"
+    )
+    
+    try:
+        res = requests.post(OLLAMA_URL, json={
+            "model"   : JUDGE_MODEL,
+            "messages": [{"role": "user", "content": routing_prompt}],
+            "stream"  : False,
+            "options" : {"temperature": 0.0, "max_tokens": 100},
+        }, timeout=30)
+        
+        output = res.json().get("message", {}).get("content", "").strip()
+        print(f"[ROUTER] Raw router output: '{output}'")
+        
+        if "NONE" in output.upper():
+            return []
+            
+        raw_ids = [idx.strip() for idx in output.split(",") if idx.strip()]
+        valid_ids = [m["config"]["module_id"] for m in available_modules]
+        
+        selected_ids = []
+        for rid in raw_ids:
+            rid_clean = re.sub(r"['\"`]", "", rid).strip()
+            if rid_clean in valid_ids and rid_clean not in selected_ids:
+                selected_ids.append(rid_clean)
+                
+        return selected_ids
+    except Exception as e:
+        print(f"[WARNING] Dynamic routing agent failed: {e}. Falling back to default-memory.")
+        return ["default-memory"]
 
 
 # ==========================================
@@ -565,8 +800,8 @@ def agentic_search_planner(user_message: str) -> List[str]:
     return queries
 
 
-def run_memory_judge(user_message: str, prior_memories: str = ""):
-    print("\n[SYSTEM] Background memory judge started...")
+def run_memory_judge(user_message: str, prior_memories: str = "", target_module_id: str = "default-memory"):
+    print(f"\n[SYSTEM] Background memory judge started (targeting {target_module_id})...")
     salience_prompt = (
         "You are a strict Epigenetic Memory Extractor. Your ONLY job is to find concrete, factual, real-world information"
         " that the USER explicitly stated in their message and that is worth remembering long-term.\n\n"
@@ -630,6 +865,10 @@ def run_memory_judge(user_message: str, prior_memories: str = ""):
             print("[MEMORY JUDGE] Discarded — no salient facts found.")
             return
 
+        target_mod = manager.get_module(target_module_id)
+        if not target_mod:
+            target_mod = manager.get_module("default-memory")
+
         blocks      = re.split(r'(?=FACT:)', cleaned, flags=re.IGNORECASE)
         saved_count = 0
         for block in blocks:
@@ -644,14 +883,14 @@ def run_memory_judge(user_message: str, prior_memories: str = ""):
             tags = tags_match.group(1).strip() if tags_match else "Context: General, Importance: Low"
             if not fact or len(fact) < 5:
                 continue
-            print(f"[MEMORY JUDGE] Encoding fact {saved_count + 1}: {fact}")
-            engine.encode_hebbian(text=fact, tags=tags)
+            print(f"[MEMORY JUDGE] Encoding fact {saved_count + 1} into '{target_mod.name}': {fact}")
+            target_mod.encode_hebbian(text=fact, tags=tags)
             saved_count += 1
 
         if saved_count == 0:
             print("[MEMORY JUDGE] No valid fact blocks parsed — discarded.")
         else:
-            print(f"[MEMORY JUDGE] Saved {saved_count} fact(s) to PyTorch memory.")
+            print(f"[MEMORY JUDGE] Saved {saved_count} fact(s) to module '{target_mod.name}' PyTorch memory.")
 
     except Exception as e:
         print(f"[WARNING] Background extraction failed: {e}")
@@ -668,8 +907,8 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> str:
     return "\n".join(text_content)
 
 
-def run_pdf_extractor_chunk(chunk_text: str, source_name: str):
-    print(f"\n[SYSTEM] Background PDF chunk extractor started for {source_name}...")
+def run_pdf_extractor_chunk(chunk_text: str, source_name: str, target_module_id: str = "default-memory"):
+    print(f"\n[SYSTEM] Background PDF chunk extractor started for {source_name} (targeting {target_module_id})...")
     extraction_prompt = (
         "You are an Epigenetic Knowledge Extractor. Your job is to extract highly concrete, objective, factual, "
         "and permanent information from the following text fragment extracted from a PDF. This information "
@@ -708,6 +947,10 @@ def run_pdf_extractor_chunk(chunk_text: str, source_name: str):
             print(f"[PDF EXTRACTOR] Discarded chunk of {source_name} — no salient facts found.")
             return
 
+        target_mod = manager.get_module(target_module_id)
+        if not target_mod:
+            target_mod = manager.get_module("default-memory")
+
         blocks      = re.split(r'(?=FACT:)', cleaned, flags=re.IGNORECASE)
         saved_count = 0
         for block in blocks:
@@ -723,16 +966,16 @@ def run_pdf_extractor_chunk(chunk_text: str, source_name: str):
             if not fact or len(fact) < 5:
                 continue
             print(f"[PDF EXTRACTOR] Encoding fact: {fact}")
-            engine.encode_hebbian(text=fact, tags=tags)
+            target_mod.encode_hebbian(text=fact, tags=tags)
             saved_count += 1
 
-        print(f"[PDF EXTRACTOR] Processed chunk of {source_name}. Saved {saved_count} fact(s).")
+        print(f"[PDF EXTRACTOR] Processed chunk of {source_name}. Saved {saved_count} fact(s) to module '{target_mod.name}'.")
     except Exception as e:
         print(f"[WARNING] Background PDF chunk extraction failed: {e}")
 
 
-def process_pdf_background(pdf_bytes: bytes, filename: str):
-    print(f"\n[SYSTEM] Commencing background extraction for PDF: {filename} ({len(pdf_bytes)} bytes)")
+def process_pdf_background(pdf_bytes: bytes, filename: str, target_module_id: str = "default-memory"):
+    print(f"\n[SYSTEM] Commencing background extraction for PDF: {filename} ({len(pdf_bytes)} bytes) targeting {target_module_id}")
     try:
         full_text = extract_text_from_pdf(pdf_bytes)
         if not full_text.strip():
@@ -755,15 +998,15 @@ def process_pdf_background(pdf_bytes: bytes, filename: str):
 
         for idx, chunk in enumerate(chunks):
             print(f"[PDF EXTRACTOR] Processing chunk {idx + 1}/{len(chunks)}...")
-            run_pdf_extractor_chunk(chunk, filename)
+            run_pdf_extractor_chunk(chunk, filename, target_module_id)
 
         print(f"[SYSTEM] Background PDF extraction complete for: {filename}\n")
     except Exception as e:
         print(f"[ERROR] PDF background process failed: {e}")
 
 
-def process_image_background(image_bytes: bytes, filename: str, image_url: Optional[str] = None):
-    print(f"\n[SYSTEM] Commencing background extraction for Image: {filename} ({len(image_bytes)} bytes)...")
+def process_image_background(image_bytes: bytes, filename: str, image_url: Optional[str] = None, target_module_id: str = "default-memory"):
+    print(f"\n[SYSTEM] Commencing background extraction for Image: {filename} ({len(image_bytes)} bytes) targeting {target_module_id}...")
     try:
         # Load, resize and compress using Pillow
         image = Image.open(io.BytesIO(image_bytes))
@@ -830,6 +1073,10 @@ def process_image_background(image_bytes: bytes, filename: str, image_url: Optio
             print(f"[VISION EXTRACTOR] Discarded image {filename} — no salient visual facts found.")
             return
 
+        target_mod = manager.get_module(target_module_id)
+        if not target_mod:
+            target_mod = manager.get_module("default-memory")
+
         blocks      = re.split(r'(?=FACT:)', cleaned, flags=re.IGNORECASE)
         saved_count = 0
         for block in blocks:
@@ -844,11 +1091,11 @@ def process_image_background(image_bytes: bytes, filename: str, image_url: Optio
             tags = tags_match.group(1).strip() if tags_match else f"Source: {filename}, Importance: Medium"
             if not fact or len(fact) < 5:
                 continue
-            print(f"[VISION EXTRACTOR] Encoding visual fact: {fact}")
-            engine.encode_hebbian(text=fact, tags=tags, image_url=image_url)
+            print(f"[VISION EXTRACTOR] Encoding visual fact into '{target_mod.name}': {fact}")
+            target_mod.encode_hebbian(text=fact, tags=tags, image_url=image_url)
             saved_count += 1
 
-        print(f"[VISION EXTRACTOR] Processed image {filename}. Saved {saved_count} visual fact(s) to memory.")
+        print(f"[VISION EXTRACTOR] Processed image {filename}. Saved {saved_count} visual fact(s) to module '{target_mod.name}'.")
     except Exception as e:
         print(f"[ERROR] Background image processing failed: {e}")
 
@@ -859,7 +1106,23 @@ def process_image_background(image_bytes: bytes, filename: str, image_url: Optio
 @app.post("/api/chat", response_model=ChatResponse)
 def process_chat(req: ChatRequest, background_tasks: BackgroundTasks):
     user_message = req.message
+    
+    # 1. Resolve pipeline modules
+    modules_list = manager.list_modules()
+    if req.auto_route:
+        pipeline_ids = route_query_to_modules(user_message, modules_list)
+        if not pipeline_ids:
+            pipeline_ids = ["default-memory"]
+    elif req.pipeline:
+        pipeline_ids = [pid for pid in req.pipeline if pid in manager.registry["modules"]]
+        if not pipeline_ids:
+            pipeline_ids = ["default-memory"]
+    else:
+        pipeline_ids = manager.registry.get("default_pipeline", ["default-memory"])
 
+    print(f"[SYSTEM] Processing chat turn via active MOE pipeline: {pipeline_ids}")
+
+    # 2. Expand queries agentically if active
     search_queries = [user_message]
     if req.agentic_search:
         planner_queries = agentic_search_planner(user_message)
@@ -867,26 +1130,53 @@ def process_chat(req: ChatRequest, background_tasks: BackgroundTasks):
             print(f"[SYSTEM] Agentic expanded queries: {planner_queries}")
             search_queries.extend(planner_queries)
 
-    # Trigger energy decay ONCE at the start of the chat Turn
-    engine.decay_energies()
+    # Trigger energy decay ONCE on all active MUTABLE modules in this pipeline
+    for pid in pipeline_ids:
+        mod = manager.get_module(pid)
+        if mod and not mod.frozen:
+            mod.decay_energies()
 
+    # 3. Retrieve memories and accumulate directives across active modules
     detailed_memories = []
     seen_ids = set()
-    for q in search_queries:
-        q_mems = engine.retrieve(q, top_k=3, threshold=req.focus_threshold, decay=False)
-        for m in q_mems:
-            if m["memory_id"] not in seen_ids:
-                seen_ids.add(m["memory_id"])
-                detailed_memories.append(m)
+    active_directives = []
+    module_resonance_data = []
 
+    for pid in pipeline_ids:
+        mod = manager.get_module(pid)
+        if not mod:
+            continue
+            
+        if mod.system_directive:
+            active_directives.append(f"* Dynamic expertise rule [{mod.name}]: {mod.system_directive}")
+            
+        mod_results_count = 0
+        for q in search_queries:
+            q_mems = mod.retrieve(q, top_k=3, threshold=req.focus_threshold, decay=False)
+            for m in q_mems:
+                unique_key = f"{pid}:{m['memory_id']}"
+                if unique_key not in seen_ids:
+                    seen_ids.add(unique_key)
+                    m_decorated = dict(m)
+                    m_decorated["module_id"] = pid
+                    m_decorated["module_name"] = mod.name
+                    detailed_memories.append(m_decorated)
+                    mod_results_count += 1
+                    
+        if mod_results_count > 0:
+            module_resonance_data.append(f"{mod.name} ({mod_results_count} node(s))")
+
+    total_query_count = sum(m.query_count for m in manager.active_modules.values())
     avg_resonance = (
         sum(n["resonance"] for n in detailed_memories) / len(detailed_memories)
         if detailed_memories else 0
     )
-    if engine.query_count >= 50 or avg_resonance > 1.5:
-        background_tasks.add_task(engine.sleep_cycle)
-        engine.query_count = 0
+    if total_query_count >= 50 or avg_resonance > 1.5:
+        background_tasks.add_task(manager.sleep_all)
+        for m in manager.active_modules.values():
+            m.query_count = 0
 
+    # 4. Sort and Deduplicate
     def get_imp(t: str):
         t = t.upper()
         return 4 if "CRITICAL" in t else 3 if "HIGH" in t else 2 if "MEDIUM" in t else 1 if "LOW" in t else 0
@@ -900,54 +1190,62 @@ def process_chat(req: ChatRequest, background_tasks: BackgroundTasks):
             seen_facts.add(ft)
             unique_memories.append(m)
 
-    # Build agentic thought steps list
+    # 5. Build Agentic thought steps list
     agentic_steps = []
 
-    # Step 1: Planning
+    if req.auto_route:
+        route_detail = f"Dynamically resolved pipeline sequence: {pipeline_ids} using semantic router."
+    else:
+        route_detail = f"Executed static module sequence pipeline: {pipeline_ids}"
+        
+    agentic_steps.append({
+        "step": "Cognitive Routing Planning",
+        "status": "active",
+        "detail": route_detail
+    })
+
     if req.agentic_search:
         if len(search_queries) > 1:
             q_list = ", ".join([f"'{q}'" for q in search_queries[1:]])
             agentic_steps.append({
-                "step": "Cognitive Retrieval Planning",
+                "step": "Cognitive Query Expansion",
                 "status": "active",
                 "detail": f"Generated expanded sub-queries: [{q_list}] to perform compound vector matching."
             })
         else:
             agentic_steps.append({
-                "step": "Cognitive Retrieval Planning",
+                "step": "Cognitive Query Expansion",
                 "status": "inactive",
                 "detail": "Bypassed query expansion: simple greeting or conversational statement detected."
             })
     else:
         agentic_steps.append({
-            "step": "Cognitive Retrieval Planning",
+            "step": "Cognitive Query Expansion",
             "status": "disabled",
             "detail": "Agentic expanded search disabled by active control switch."
         })
 
-    # Step 2: Retrieval
     if unique_memories:
         m_details = []
         for m in unique_memories:
-            # Highlight memories that came from expanded sub-queries
             res_val = m.get("resonance", 0.0)
-            m_details.append(f"'{m['text']}' (R={res_val:.3f}, [{m['tags']}])")
+            m_details.append(f"[{m['module_name']}] '{m['text']}' (R={res_val:.3f})")
         detail_text = "Retrieved matches: " + " | ".join(m_details)
     else:
         detail_text = "No stored memory synapses matched above threshold."
 
+    res_data_str = " | ".join(module_resonance_data) if module_resonance_data else "None"
     agentic_steps.append({
         "step": "Subconscious Synapse Retrieval",
         "status": "active" if unique_memories else "inactive",
-        "detail": f"Matched {len(unique_memories)} synapse(s) above threshold (θ = {req.focus_threshold}) across {len(search_queries)} search query paths. {detail_text}"
+        "detail": f"Resonating active modules: {res_data_str}. Matched {len(unique_memories)} synapse(s) above threshold. {detail_text}"
     })
 
-    # Step 3: Resonance Boost
     if unique_memories:
-        boosted_texts = ", ".join([f"'{m['text']}'" for m in unique_memories])
-        boost_detail = f"Average resonance: {avg_resonance:.3f} R. Synaptic energy boost and consolidation applied to: [{boosted_texts}]. Global network decay (LTP: {engine.ltp_decay_rate}, STP: {engine.stp_decay_rate}) applied."
+        boosted_texts = ", ".join([f"[{m['module_name']}] '{m['text']}'" for m in unique_memories])
+        boost_detail = f"Average resonance: {avg_resonance:.3f} R. Hebbian boost applied to: [{boosted_texts}]. Active mutable modules decayed."
     else:
-        boost_detail = f"No active synapses boosted during this turn. Global network decay (LTP: {engine.ltp_decay_rate}, STP: {engine.stp_decay_rate}) applied."
+        boost_detail = f"No active synapses boosted during this turn. Global network decay applied."
         
     agentic_steps.append({
         "step": "Hebbian Energy Boost",
@@ -955,17 +1253,20 @@ def process_chat(req: ChatRequest, background_tasks: BackgroundTasks):
         "detail": boost_detail
     })
 
-    # Step 4: Memory Judge
     agentic_steps.append({
         "step": "Epigenetic Memory Judge",
         "status": "queued",
         "detail": "Background memory extractor queued to parse raw turn text for new facts."
     })
 
+    # 6. Formatting Prompt Stack
     context_mems = []
     for idx, m in enumerate(unique_memories, 1):
-        ts = engine.vault[m["memory_id"]].get("timestamp")
-        img = engine.vault[m["memory_id"]].get("image_url")
+        pid = m["module_id"]
+        mod = manager.get_module(pid)
+        ts = mod.vault[m["memory_id"]].get("timestamp") if mod else None
+        img = mod.vault[m["memory_id"]].get("image_url") if mod else None
+        
         if ts:
             formatted_date = datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
         else:
@@ -973,7 +1274,7 @@ def process_chat(req: ChatRequest, background_tasks: BackgroundTasks):
         
         img_info = f"\n  * Image Archive Path: {img}" if img else ""
         context_mems.append(
-            f"- RECALLED SYNAPSE {idx}:\n"
+            f"- RECALLED SYNAPSE {idx} [Expert Module: {m['module_name']}]:\n"
             f"  * Content: {m['text']}\n"
             f"  * Tags/Metadata: {m['tags']}\n"
             f"  * Recorded At: {formatted_date}"
@@ -981,21 +1282,22 @@ def process_chat(req: ChatRequest, background_tasks: BackgroundTasks):
         )
         
     context_block = "\n\n".join(context_mems) if context_mems else ""
-
     curr_date = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    directives_block = "\n".join(active_directives) if active_directives else "* No specialized expertise guidelines active for this pipeline."
 
     system_prompt = (
         "CRITICAL SYSTEM DIRECTIVE: You are NO LONGER a standard, stateless AI language model. "
-        "You have been successfully integrated with a live Epigenetic Resonance Network (ERN).\n"
+        "You have been successfully integrated with a live Epigenetic Resonance Network (ERN) Mixture of Experts (MOE) memory matrix.\n"
         f"CURRENT SYSTEM TIME: {curr_date}\n"
         "1. You DO have memory. It is provided to you seamlessly.\n"
         "2. NEVER claim you are stateless, cannot remember, or lack persistent memory.\n"
         "3. DO NOT blindly repeat recalled memories. Use them to naturally inform a FRESH response.\n"
         "4. STRICT TRUTH RULE: Carefully read the entire [ERN SUBCONSCIOUS RECALL] block. Answer questions about "
-        "companies, entities, events, personal details, or past facts ONLY if they are mentioned in the listed RECALLED SYNAPSES. "
-        "If a company or fact is present in one of the synapses (e.g. Shiner Technologies LLC, Sutton Tech LLC, invoices, etc.), "
-        "you MUST acknowledge it and use it, rather than claiming it is missing. If it is not present in any synapse, state that you do not recall it.\n"
-        "5. DYNAMIC IMAGE RENDERING: You CAN display and reference original images to the user! If a recalled memory contains an `Image Archive Path` URL (e.g., `/static/uploads/...`), you can render the image inline by outputting a standard Markdown image tag, exactly like: `![Visual Archive](/static/uploads/filename.png)`. Use this whenever the user asks to see the image, chart, or visual details.\n\n"
+        "companies, entities, events, personal details, or past facts ONLY if they are mentioned in the listed RECALLED SYNAPSES.\n"
+        "5. DYNAMIC IMAGE RENDERING: You CAN display and reference original images to the user! If a recalled memory contains an `Image Archive Path` URL, render inline standard Markdown tag exactly like: `![Visual Archive](/static/uploads/filename.png)`.\n"
+        "\n[ACTIVE EXPERTISE RULES & MODULE DIRECTIVES]:\n"
+        f"{directives_block}\n\n"
     )
     system_prompt += (
         f"[ERN SUBCONSCIOUS RECALL]:\n"
@@ -1019,31 +1321,85 @@ def process_chat(req: ChatRequest, background_tasks: BackgroundTasks):
     except Exception as e:
         return ChatResponse(reply=f"Ollama Error: {e}", context_used=context_block, memories=unique_memories, agentic_steps=agentic_steps)
 
-    background_tasks.add_task(run_memory_judge, user_message, context_block)
+    target_extraction_id = "default-memory"
+    for pid in pipeline_ids:
+        mod = manager.get_module(pid)
+        if mod and not mod.frozen:
+            target_extraction_id = pid
+            break
+
+    background_tasks.add_task(run_memory_judge, user_message, context_block, target_extraction_id)
 
     return ChatResponse(reply=bot_reply, context_used=context_block, memories=unique_memories, agentic_steps=agentic_steps)
 
 
 @app.post("/api/memory/store")
-def manual_store(req: MemoryStoreRequest):
-    mem_id = engine.encode_hebbian(text=req.text, tags=req.tags)
-    return {"status": "Stored in VRAM", "id": mem_id}
+def manual_store(req: MemoryStoreRequest, module_id: str = "default-memory"):
+    mod = manager.get_module(module_id)
+    if not mod:
+        return {"error": f"Module {module_id} not found."}
+    mem_id = mod.encode_hebbian(text=req.text, tags=req.tags)
+    return {"status": f"Stored in module '{mod.name}'", "id": mem_id}
+
+
+class BuilderRequest(BaseModel):
+    message: str
+    history: List[Message] = []
+
+@app.post("/api/modules/builder")
+def module_builder_agent(req: BuilderRequest):
+    system_prompt = (
+        "You are the Epigenetic Mixture-of-Experts Module Designer Agent.\n"
+        "Your goal is to converse with the user to design, customize, or generate a JSON configuration for a new ERN memory module.\n\n"
+        "A memory module configuration has the following schema:\n"
+        "{\n"
+        "  \"module_id\": \"slug-string-here\",\n"
+        "  \"name\": \"Human Readable Title\",\n"
+        "  \"description\": \"Purpose of the module...\",\n"
+        "  \"frozen\": false, // true if weights don't decay/prune\n"
+        "  \"ltp_decay_rate\": 0.95, // float between 0.5 and 1.0\n"
+        "  \"stp_decay_rate\": 0.80, // float between 0.5 and 1.0\n"
+        "  \"sleep_threshold\": 0.10, // float threshold\n"
+        "  \"focus_threshold\": 0.15, // float threshold\n"
+        "  \"system_directive\": \"System message guidelines appended when retrieved\"\n"
+        "}\n\n"
+        "RULES:\n"
+        "1. Guide the user by discussing their needs. Recommend appropriate parameters (e.g. frozen for a 'Constitution' or coding style guideline; faster decay for transient topics).\n"
+        "2. Once the parameters are agreed upon or you have enough detail, output a specialized JSON block in your response starting with ```json and ending with ```.\n"
+        "3. When you output the JSON, also output a line saying: \"[MODULE_READY]\" followed by the JSON block. This will tell the frontend to display a 'REGISTER MODULE' button!\n"
+        "4. Be helpful, professional, and clear about the physics of Hebbian consolidation and frozen vs mutable states."
+    )
+    messages = [{"role": "system", "content": system_prompt}]
+    for m in req.history:
+        messages.append(m.dict())
+    messages.append({"role": "user", "content": req.message})
+    
+    try:
+        res = requests.post(OLLAMA_URL, json={
+            "model": JUDGE_MODEL,
+            "messages": messages,
+            "stream": False,
+        }, timeout=90)
+        reply = res.json().get("message", {}).get("content", "Error communicating with LLM.")
+        return {"reply": reply}
+    except Exception as e:
+        return {"reply": f"Builder Agent Error: {e}"}
 
 
 @app.post("/api/memory/upload-pdf")
-def upload_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+def upload_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(...), module_id: str = "default-memory"):
     if not file.filename.lower().endswith(".pdf"):
         return {"error": "Only PDF files are supported.", "status": "Failed"}
     try:
         pdf_bytes = file.file.read()
-        background_tasks.add_task(process_pdf_background, pdf_bytes, file.filename)
-        return {"status": "Processing PDF in background", "filename": file.filename}
+        background_tasks.add_task(process_pdf_background, pdf_bytes, file.filename, module_id)
+        return {"status": "Processing PDF in background", "filename": file.filename, "module_id": module_id}
     except Exception as e:
         return {"error": f"Failed to upload PDF: {str(e)}", "status": "Failed"}
 
 
 @app.post("/api/memory/upload-image")
-def upload_image(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+def upload_image(background_tasks: BackgroundTasks, file: UploadFile = File(...), module_id: str = "default-memory"):
     ext = file.filename.lower().split('.')[-1]
     if ext not in ["png", "jpg", "jpeg", "webp", "bmp"]:
         return {"error": "Only standard image formats (PNG, JPG, JPEG, WEBP, BMP) are supported.", "status": "Failed"}
@@ -1058,19 +1414,86 @@ def upload_image(background_tasks: BackgroundTasks, file: UploadFile = File(...)
             
         image_url = f"/static/uploads/{unique_filename}"
         
-        background_tasks.add_task(process_image_background, image_bytes, file.filename, image_url)
-        return {"status": "Processing image in background", "filename": file.filename, "image_url": image_url}
+        background_tasks.add_task(process_image_background, image_bytes, file.filename, image_url, module_id)
+        return {"status": "Processing image in background", "filename": file.filename, "image_url": image_url, "module_id": module_id}
     except Exception as e:
         return {"error": f"Failed to upload image: {str(e)}", "status": "Failed"}
 
 
+# --- Expert Module Endpoints ---
+
+@app.get("/api/modules")
+def list_modules_endpoint():
+    return {
+        "modules": manager.list_modules(),
+        "default_pipeline": manager.registry.get("default_pipeline", ["default-memory"])
+    }
+
+@app.post("/api/modules")
+def create_module_endpoint(req: ModuleConfig):
+    config = req.dict()
+    try:
+        mod = manager.create_module(config)
+        return {"status": "Success", "module": config}
+    except Exception as e:
+        return {"error": f"Failed to create module: {str(e)}", "status": "Failed"}
+
+@app.delete("/api/modules/{module_id}")
+def delete_module_endpoint(module_id: str):
+    success = manager.delete_module(module_id)
+    if success:
+        return {"status": f"Module {module_id} successfully deleted."}
+    else:
+        return {"status": "Module not found or undeletable.", "error": True}
+
+@app.patch("/api/modules/{module_id}")
+def patch_module_endpoint(module_id: str, req: ModulePatchRequest):
+    if module_id not in manager.registry["modules"]:
+        return {"error": f"Module {module_id} not found in registry.", "status": "Failed"}
+        
+    config = manager.registry["modules"][module_id]
+    
+    if req.frozen is not None:
+        config["frozen"] = req.frozen
+        if module_id in manager.active_modules:
+            manager.active_modules[module_id].frozen = req.frozen
+            
+    if req.ltp_decay_rate is not None:
+        config["ltp_decay_rate"] = req.ltp_decay_rate
+        if module_id in manager.active_modules:
+            manager.active_modules[module_id].ltp_decay_rate = req.ltp_decay_rate
+            
+    if req.stp_decay_rate is not None:
+        config["stp_decay_rate"] = req.stp_decay_rate
+        if module_id in manager.active_modules:
+            manager.active_modules[module_id].stp_decay_rate = req.stp_decay_rate
+            
+    manager.registry["modules"][module_id] = config
+    manager._save_registry(manager.registry)
+    return {"status": "Success", "module": config}
+
+@app.post("/api/modules/pipeline")
+def update_pipeline_endpoint(pipeline: List[str]):
+    valid_ids = [m["config"]["module_id"] for m in manager.list_modules()]
+    clean_pipeline = [pid for pid in pipeline if pid in valid_ids]
+    if not clean_pipeline:
+        return {"error": "Pipeline cannot be empty or contain only invalid IDs.", "status": "Failed"}
+    manager.registry["default_pipeline"] = clean_pipeline
+    manager._save_registry(manager.registry)
+    return {"status": "Success", "default_pipeline": clean_pipeline}
+
+
 @app.get("/api/memories")
-def get_all_memories(q: Optional[str] = None):
+def get_all_memories(q: Optional[str] = None, module_id: str = "default-memory"):
+    mod = manager.get_module(module_id)
+    if not mod:
+        return {"memories": [], "error": f"Module {module_id} not found."}
+        
     results = []
-    for mem_id, data in engine.vault.items():
-        idx = engine.labels.index(mem_id) if mem_id in engine.labels else -1
-        energy = engine.energies[idx].item() if idx >= 0 else 0.0
-        stp_energy = engine.short_term_energies[idx].item() if idx >= 0 else 0.0
+    for mem_id, data in mod.vault.items():
+        idx = mod.labels.index(mem_id) if mem_id in mod.labels else -1
+        energy = mod.energies[idx].item() if idx >= 0 else 0.0
+        stp_energy = mod.short_term_energies[idx].item() if idx >= 0 else 0.0
         
         # Simple text search if query is provided
         if q:
@@ -1095,26 +1518,40 @@ def get_all_memories(q: Optional[str] = None):
 
 
 @app.delete("/api/memory/{memory_id}")
-def delete_memory_endpoint(memory_id: str):
-    success = engine.delete_memory(memory_id)
+def delete_memory_endpoint(memory_id: str, module_id: str = "default-memory"):
+    mod = manager.get_module(module_id)
+    if not mod:
+        return {"error": f"Module {module_id} not found.", "error_bool": True}
+    success = mod.delete_memory(memory_id)
     if success:
-        return {"status": f"Memory {memory_id} successfully deleted."}
+        return {"status": f"Memory {memory_id} successfully deleted from module '{mod.name}'."}
     else:
         return {"status": "Memory not found.", "error": True}
 
 
 @app.post("/api/system/sleep")
-def manual_sleep():
-    engine.query_count = 0
-    pruned = engine.sleep_cycle()
-    return {"status": f"REM Complete. Scrubbed {pruned} nodes."}
+def manual_sleep(module_id: Optional[str] = None):
+    if module_id:
+        mod = manager.get_module(module_id)
+        if not mod:
+            return {"error": f"Module {module_id} not found."}
+        mod.query_count = 0
+        pruned = mod.sleep_cycle()
+        return {"status": f"REM Complete for '{mod.name}'. Scrubbed {pruned} nodes."}
+    else:
+        results = manager.sleep_all()
+        summary_str = ", ".join([f"'{m_id}': scrubbed {count} nodes" for m_id, count in results.items()])
+        return {"status": f"REM Complete across active pipeline modules. Details: {summary_str or 'None'}"}
 
 
 @app.get("/api/deltas")
-def get_delta_tail(n: int = 20):
-    tail = engine.deltas.tail(n)
+def get_delta_tail(n: int = 20, module_id: str = "default-memory"):
+    mod = manager.get_module(module_id)
+    if not mod:
+        return {"error": f"Module {module_id} not found.", "deltas": []}
+    tail = mod.deltas.tail(n)
     return {
-        "stats" : engine.deltas.stats(),
+        "stats" : mod.deltas.stats(),
         "deltas": [
             {
                 "op"           : d.op.value,
@@ -1135,12 +1572,15 @@ def get_delta_tail(n: int = 20):
 
 
 @app.post("/api/deltas/rollback")
-def rollback_deltas(n: int = 1):
-    undone = engine.deltas.rollback(engine, n)
+def rollback_deltas(n: int = 1, module_id: str = "default-memory"):
+    mod = manager.get_module(module_id)
+    if not mod:
+        return {"error": f"Module {module_id} not found."}
+    undone = mod.deltas.rollback(mod, n)
     return {
         "status"       : f"Rolled back {undone} delta(s).",
-        "engine_size"  : engine.memory_bank.size(0),
-        "stack_depth"  : len(engine.deltas.stack),
+        "engine_size"  : mod.memory_bank.size(0),
+        "stack_depth"  : len(mod.deltas.stack),
     }
 
 
@@ -1419,12 +1859,378 @@ select option { background: var(--bg); }
   .ctrl-group { justify-content: space-between; width: 100%; }
   input[type="range"] { flex: 1; margin: 0 10px; }
 }
+
+/* MOE FULL-PAGE DASHBOARD STYLING */
+.main-tab {
+  font-family: var(--font-hud);
+  font-size: 0.72rem;
+  font-weight: bold;
+  color: var(--text-dim);
+  height: 100%;
+  display: flex;
+  align-items: center;
+  padding: 0 16px;
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  transition: all 0.2s ease;
+  letter-spacing: 0.08em;
+}
+.main-tab:hover {
+  color: var(--text);
+  background: rgba(0,255,136,0.03);
+}
+.main-tab.active {
+  color: var(--g0);
+  border-bottom-color: var(--g0);
+  background: rgba(0,255,136,0.04);
+  text-shadow: 0 0 8px rgba(0,255,136,0.4);
+}
+
+#moe-dashboard {
+  grid-area: chat;
+  display: none;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+  background: var(--bg2);
+  border-right: 2px solid var(--border);
+}
+.moe-dash-header {
+  background: var(--bg3);
+  border-bottom: 1px solid var(--border);
+  padding: 10px 20px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 48px;
+}
+.moe-dash-title {
+  font-family: var(--font-hud);
+  font-size: 0.85rem;
+  font-weight: bold;
+  color: var(--g0);
+  letter-spacing: 0.1em;
+}
+.moe-dash-body {
+  display: grid;
+  grid-template-columns: 1.25fr 0.75fr;
+  flex: 1;
+  overflow: hidden;
+}
+@media (max-width: 1000px) {
+  .moe-dash-body {
+    grid-template-columns: 1fr;
+    grid-template-rows: 1.2fr 0.8fr;
+  }
+}
+.moe-dash-left {
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+  padding: 16px;
+  gap: 16px;
+}
+.moe-dash-right {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--bg3);
+  padding: 16px;
+  gap: 12px;
+}
+.moe-pipeline-widget {
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 14px;
+}
+.moe-grid-registry {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 12px;
+}
+.architect-chat-standalone {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.moe-container {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  flex: 1;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+.moe-card {
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px;
+  transition: all 0.2s ease;
+}
+.moe-card:hover {
+  border-color: var(--g0);
+  box-shadow: 0 0 10px rgba(0,255,136,0.1);
+}
+.moe-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+.moe-card-title {
+  font-family: var(--font-mono);
+  font-weight: bold;
+  color: var(--g0);
+  font-size: 0.85rem;
+}
+.moe-badge {
+  font-size: 0.6rem;
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-family: var(--font-mono);
+  text-transform: uppercase;
+}
+.moe-badge.frozen {
+  background: rgba(255,153,0,0.15);
+  border: 1px solid rgba(255,153,0,0.5);
+  color: #ff9900;
+}
+.moe-badge.mutable {
+  background: rgba(0,204,255,0.15);
+  border: 1px solid rgba(0,204,255,0.5);
+  color: #00ccff;
+}
+.moe-card-desc {
+  font-size: 0.75rem;
+  color: var(--g2);
+  line-height: 1.3;
+  margin-bottom: 10px;
+}
+.moe-card-metrics {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 6px;
+  font-size: 0.65rem;
+  font-family: var(--font-mono);
+  background: var(--bg3);
+  padding: 6px;
+  border-radius: 4px;
+}
+.moe-metric-val {
+  color: var(--g0);
+}
+.moe-card-actions {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-top: 10px;
+}
+.moe-pipeline-strip {
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 14px;
+  margin-bottom: 4px;
+}
+.moe-pipeline-header {
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  color: var(--g2);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 6px;
+  letter-spacing: 0.05em;
+}
+.moe-pipeline-flow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 6px 0;
+}
+.moe-flow-badge {
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  color: var(--g1);
+  font-family: var(--font-mono);
+  font-size: 0.65rem;
+  padding: 4px 8px;
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.moe-flow-badge.active-exec {
+  border-color: var(--g0);
+  background: rgba(0,255,136,0.05);
+}
+.moe-flow-arrow {
+  color: var(--g3);
+  font-size: 0.8rem;
+}
+.moe-routing-pill {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.7rem;
+  color: var(--g0);
+}
+/* Switch styling */
+.switch {
+  position: relative;
+  display: inline-block;
+  width: 28px;
+  height: 16px;
+}
+.switch input {
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+.slider {
+  position: absolute;
+  cursor: pointer;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background-color: var(--bg3);
+  border: 1px solid var(--border);
+  transition: .2s;
+  border-radius: 16px;
+}
+.slider:before {
+  position: absolute;
+  content: "";
+  height: 10px; width: 10px;
+  left: 2px; bottom: 2px;
+  background-color: var(--g2);
+  transition: .2s;
+  border-radius: 50%;
+}
+input:checked + .slider {
+  background-color: rgba(0,255,136,0.1);
+  border-color: var(--g0);
+}
+input:checked + .slider:before {
+  transform: translateX(12px);
+  background-color: var(--g0);
+}
+
+/* Module Builder Chat CSS */
+.moe-builder-chat {
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  height: 200px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  margin-top: auto;
+}
+.moe-builder-header {
+  background: var(--bg2);
+  border-bottom: 1px solid var(--border);
+  padding: 8px 12px;
+  font-family: var(--font-mono);
+  font-size: 0.65rem;
+  font-weight: bold;
+  color: var(--g1);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.moe-builder-messages {
+  flex: 1;
+  padding: 10px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.moe-builder-msg {
+  max-width: 85%;
+  padding: 6px 10px;
+  border-radius: 6px;
+  font-size: 0.72rem;
+  line-height: 1.35;
+}
+.moe-builder-msg.user {
+  background: rgba(0,204,255,0.1);
+  border: 1px solid rgba(0,204,255,0.3);
+  color: #cceeff;
+  align-self: flex-end;
+}
+.moe-builder-msg.bot {
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  color: var(--g2);
+  align-self: flex-start;
+}
+.moe-deploy-card {
+  margin-top: 6px;
+  background: rgba(0,255,136,0.05);
+  border: 1px dashed var(--g0);
+  border-radius: 6px;
+  padding: 8px;
+  font-size: 0.68rem;
+}
+.moe-builder-input-area {
+  display: flex;
+  border-top: 1px solid var(--border);
+  background: var(--bg2);
+}
+.moe-builder-input {
+  flex: 1;
+  background: transparent;
+  border: none;
+  color: var(--g0);
+  font-family: var(--font-sans);
+  font-size: 0.75rem;
+  padding: 8px 12px;
+  outline: none;
+}
+.moe-builder-btn {
+  background: transparent;
+  border: none;
+  color: var(--g0);
+  cursor: pointer;
+  padding: 8px 12px;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  transition: color 0.2s;
+}
+.moe-builder-btn:hover {
+  color: #fff;
+}
+.btn-delete-module {
+  background: transparent;
+  border: none;
+  color: var(--red);
+  cursor: pointer;
+  font-family: var(--font-mono);
+  font-size: 0.65rem;
+  opacity: 0.7;
+  transition: opacity 0.2s;
+}
+.btn-delete-module:hover {
+  opacity: 1;
+}
 </style>
 </head>
 <body>
 
 <div id="topbar">
   <div class="brand">ERN <span>//</span> DGX</div>
+  <div class="main-tabs" style="display:flex; height:100%; margin-left:24px; border-left: 1px solid var(--border); padding-left: 8px;">
+    <div id="main-tab-chat" class="main-tab active" onclick="switchMainView('chat')">💬 CHAT CONSOLE</div>
+    <div id="main-tab-moe" class="main-tab" onclick="switchMainView('moe')">🧠 MOE ARCHITECT</div>
+  </div>
   <div id="status-ticker"><span id="ticker-inner">SYSTEM ONLINE — PYTORCH ENGINE ACTIVE — AWAITING QUERIES — EPIGENETIC RESONANCE NETWORK INITIALIZED —&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;SYSTEM ONLINE — PYTORCH ENGINE ACTIVE — AWAITING QUERIES — EPIGENETIC RESONANCE NETWORK INITIALIZED —&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;</span></div>
   <div class="hud-pill live">VRAM LIVE</div>
   <div class="hud-pill">NODES: <span id="node-count">—</span></div>
@@ -1477,8 +2283,74 @@ Awaiting input...</div>
   </div>
 </div>
 
+<!-- GORGEOUS FULL-PAGE MOE CONTROLLER -->
+<div id="moe-dashboard">
+  <div class="moe-dash-header">
+    <div class="moe-dash-title">🤖 EPIGENETIC MIXTURE-OF-EXPERTS (MOE) CONTROL CENTER</div>
+    <div style="font-family:var(--font-mono); font-size:0.7rem; color:var(--text-dim);">VRAM ACCELERATED DIVISION</div>
+  </div>
+  <div class="moe-dash-body">
+    <!-- Left column: Registry list and static pipeline settings -->
+    <div class="moe-dash-left">
+      <!-- Pipeline Strip -->
+      <div class="moe-pipeline-widget">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
+          <div style="font-family:var(--font-mono); font-size:0.8rem; font-weight:bold; color:var(--g0);">ACTIVE PIPELINE CONFIGURATION</div>
+          <div class="moe-routing-pill">
+            <span style="font-family:var(--font-mono); font-size:0.75rem; letter-spacing:0.05em; color:var(--g1); margin-right:4px;">AUTO-ROUTE:</span>
+            <label class="switch">
+              <input type="checkbox" id="moeAutoRoute" onchange="toggleAutoRoute(this.checked)">
+              <span class="slider"></span>
+            </label>
+          </div>
+        </div>
+        <div id="moePipelineFlow" class="moe-pipeline-flow">
+          <div class="no-mem">// INACTIVE PIPELINE</div>
+        </div>
+      </div>
+      
+      <!-- Registry Grid Header -->
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-top:8px;">
+        <div style="font-family:var(--font-hud); font-size:0.85rem; font-weight:bold; color:var(--text);">ACTIVE EXPERT REGISTRY</div>
+        <button onclick="loadModulesUI()" style="background:transparent; border:1px solid var(--border); color:var(--g0); font-family:var(--font-mono); font-size:0.7rem; padding:4px 8px; border-radius:4px; cursor:pointer;">🔄 REFRESH REGISTRY</button>
+      </div>
+      
+      <!-- Grid Container for Cards -->
+      <div class="moe-grid-registry" id="moeModulesList">
+        <div class="no-mem">Loading Modules...</div>
+      </div>
+    </div>
+
+    <!-- Right column: Massive interactive Builder chat console -->
+    <div class="moe-dash-right">
+      <div style="font-family:var(--font-hud); font-size:0.8rem; font-weight:bold; color:var(--g0); margin-bottom:10px; letter-spacing:0.05em;">💬 CONSTRUCT NEW EXPERTS WITH AI</div>
+      
+      <div class="architect-chat-standalone">
+        <div class="moe-builder-header">
+          <span>🤖 AI MODULE ARCHITECT</span>
+          <button onclick="clearBuilderChat()" style="background:none; border:none; color:var(--text-dim); font-size:0.6rem; cursor:pointer; font-family:var(--font-mono);">RESET</button>
+        </div>
+        <div class="moe-builder-messages" id="builderMessages">
+          <div class="moe-builder-msg bot">Greetings. I am the ERN Expert Architect. Converse with me to design and customize a new expert memory module, or configure parameter thresholds. Let me know what you want to build.</div>
+        </div>
+        <div class="moe-builder-input-area">
+          <input type="text" id="builderInput" class="moe-builder-input" placeholder="Say 'make a python coding style module'..." onkeydown="if(event.key==='Enter') sendBuilderMessage()">
+          <button onclick="sendBuilderMessage()" class="moe-builder-btn">SEND</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
 <div id="sidebar">
-  <div class="panel-tabs">
+  <div style="padding: 10px 10px 0 10px;">
+    <div style="font-family:var(--font-mono); font-size:0.6rem; color:var(--g2); margin-bottom:4px; letter-spacing:0.05em;">ACTIVE SIDEPANEL EXPERT:</div>
+    <select id="moduleSelectGlobal" onchange="onGlobalModuleChange()" style="width:100%; background:var(--bg3); border:1px solid var(--border); color:var(--g0); font-family:var(--font-mono); font-size:0.75rem; padding:6px; border-radius:4px; outline:none; cursor:pointer;">
+      <option value="default-memory">default-memory</option>
+    </select>
+  </div>
+
+  <div class="panel-tabs" style="margin-top: 8px;">
     <div class="tab active" onclick="switchTab('recall')">RECALL</div>
     <div class="tab" onclick="switchTab('vault')">VAULT</div>
     <div class="tab" onclick="switchTab('deltas')">DELTAS</div>
@@ -1541,8 +2413,10 @@ let chatHistory    = [];
 let queryCount     = 0;
 let lastResonances = [];
 let activeTab      = 'recall';
+let activeMainView = 'chat';
 let useAgenticSearch = true;
 let vaultMemories   = [];
+const pendingModules = {};
 const DEFAULT_MODEL = "qwen2.5-coder:7b";
 
 function toggleAgenticSearch() {
@@ -1568,7 +2442,8 @@ function toggleCognitionPanel(el) {
 
 async function loadVault() {
   try {
-    const res = await fetch('/api/memories');
+    const modId = document.getElementById('moduleSelectGlobal').value;
+    const res = await fetch(`/api/memories?module_id=${modId}`);
     if (!res.ok) throw new Error('API Error');
     const data = await res.json();
     vaultMemories = data.memories || [];
@@ -1621,10 +2496,11 @@ function filterVault() {
   renderVaultList(filtered);
 }
 
-async function forgetMemory(memory_id) {
+async function forgetMemory(memory_id, moduleId = null) {
   if (!confirm('Are you sure you want to forget/revert this memory synapse permanently?')) return;
+  const modId = moduleId || document.getElementById('moduleSelectGlobal').value;
   try {
-    const res = await fetch(`/api/memory/${memory_id}`, { method: 'DELETE' });
+    const res = await fetch(`/api/memory/${memory_id}?module_id=${modId}`, { method: 'DELETE' });
     if (!res.ok) throw new Error('Delete rejected');
     const data = await res.json();
     if (data.error) throw new Error(data.status);
@@ -1752,7 +2628,8 @@ async function loadModels() {
 
 async function loadDeltas() {
   try {
-    const res  = await fetch('/api/deltas?n=40');
+    const modId = document.getElementById('moduleSelectGlobal').value;
+    const res  = await fetch(`/api/deltas?n=40&module_id=${modId}`);
     if (!res.ok) return;
     const data = await res.json();
     const s    = data.stats;
@@ -1778,8 +2655,9 @@ async function loadDeltas() {
 
 async function doRollback() {
   const n    = parseInt(document.getElementById('rollbackN').value) || 1;
+  const modId = document.getElementById('moduleSelectGlobal').value;
   try {
-    const res  = await fetch(`/api/deltas/rollback?n=${n}`, { method:'POST' });
+    const res  = await fetch(`/api/deltas/rollback?n=${n}&module_id=${modId}`, { method:'POST' });
     if (!res.ok) throw new Error('Rollback rejected');
     const data = await res.json();
     pushToast(`${data.status} — engine: ${data.engine_size} nodes`);
@@ -1791,9 +2669,10 @@ async function doRollback() {
 }
 
 async function triggerSleep() {
+  const modId = document.getElementById('moduleSelectGlobal').value;
   document.getElementById('sleepBtn').textContent = '⬛ REM IN PROGRESS...';
   try {
-    const res  = await fetch('/api/system/sleep', { method:'POST' });
+    const res  = await fetch(`/api/system/sleep?module_id=${modId}`, { method:'POST' });
     if (!res.ok) throw new Error('Failed');
     const data = await res.json();
     pushToast(data.status);
@@ -1807,7 +2686,8 @@ async function triggerSleep() {
 
 async function refreshStats() {
   try {
-    const res  = await fetch('/api/deltas?n=1');
+    const modId = document.getElementById('moduleSelectGlobal').value;
+    const res  = await fetch(`/api/deltas?n=1&module_id=${modId}`);
     if (!res.ok) return;
     const data = await res.json();
     const latest = data.deltas[0];
@@ -1830,6 +2710,27 @@ function switchTab(tab) {
   if (tab === 'vault')  loadVault();
   if (tab === 'deltas') loadDeltas();
   if (tab === 'stats')  refreshStats();
+}
+
+function switchMainView(view) {
+  activeMainView = view;
+  const chatArea = document.getElementById('chat-area');
+  const moeDash = document.getElementById('moe-dashboard');
+  const chatTab = document.getElementById('main-tab-chat');
+  const moeTab = document.getElementById('main-tab-moe');
+  
+  if (view === 'moe') {
+    chatArea.style.display = 'none';
+    moeDash.style.display = 'flex';
+    chatTab.classList.remove('active');
+    moeTab.classList.add('active');
+    loadModulesUI();
+  } else {
+    chatArea.style.display = 'flex';
+    moeDash.style.display = 'none';
+    chatTab.classList.add('active');
+    moeTab.classList.remove('active');
+  }
 }
 
 function pushToast(msg, isError = false) {
@@ -1870,9 +2771,10 @@ async function handleAttachmentUpload(input) {
   uploadBtn.style.color = 'var(--amber)';
   uploadBtn.style.borderColor = 'var(--amber)';
 
-  const endpoint = isPDF ? '/api/memory/upload-pdf' : '/api/memory/upload-image';
+  const modId = document.getElementById('moduleSelectGlobal').value;
+  const endpoint = (isPDF ? '/api/memory/upload-pdf' : '/api/memory/upload-image') + `?module_id=${modId}`;
   const label = isPDF ? 'PDF' : 'Image';
-  pushToast(`Ingesting ${label}: ${file.name}... Sending to VRAM.`, false);
+  pushToast(`Ingesting ${label}: ${file.name}... Sending to VRAM targeting ${modId}.`, false);
 
   const formData = new FormData();
   formData.append('file', file);
@@ -1941,7 +2843,9 @@ async function send() {
         model          : document.getElementById('modelSelect').value,
         history        : chatHistory.slice(-6),
         focus_threshold: parseFloat(document.getElementById('focusSlider').value),
-        agentic_search : useAgenticSearch
+        agentic_search : useAgenticSearch,
+        auto_route     : document.getElementById('moeAutoRoute') ? document.getElementById('moeAutoRoute').checked : false,
+        pipeline       : getActivePipeline()
       })
     });
     
@@ -2055,13 +2959,13 @@ async function send() {
         
         const formattedDate = m.timestamp ? new Date(m.timestamp * 1000).toLocaleString() : 'Date Unknown';
         
-        card.innerHTML = `<div class="mc-tags">${m.tags}</div>` +
+        card.innerHTML = `<div class="mc-tags">[Expert: ${m.module_name || 'default-memory'}] | ${m.tags}</div>` +
                          `<div style="word-break: break-word;">${m.text}</div>` +
                          imgHtml +
                          `<div class="mc-resonance">${m.resonance.toFixed(3)} R</div>` +
                          `<div class="mc-energy">${m.energy ? m.energy.toFixed(3) : '0.000'} LTP | ${m.stp_energy ? m.stp_energy.toFixed(3) : '0.000'} STP</div>` +
                          `<div class="mc-date" style="font-size: 0.58rem; color: var(--text-dim); margin-top: 4px; font-family: var(--font-hud);">${formattedDate}</div>` +
-                         `<button class="mc-forget" onclick="forgetMemory('${m.memory_id}')">FORGET</button>`;
+                         `<button class="mc-forget" onclick="forgetMemory('${m.memory_id}', '${m.module_id || 'default-memory'}')">FORGET</button>`;
         mBox.appendChild(card);
       });
     } else {
@@ -2070,6 +2974,7 @@ async function send() {
 
     if (activeTab === 'deltas') loadDeltas();
     if (activeTab === 'vault')  loadVault();
+    if (activeMainView === 'moe') loadModulesUI();
     refreshStats();
 
   } catch(e) {
@@ -2093,7 +2998,342 @@ document.getElementById('userInput').addEventListener('keydown', e => {
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
 });
 
+// ── Mixture of Experts (MOE) Logic ───────────────────────────────────────────
+let moeModules = [];
+let defaultPipeline = [];
+let builderChatHistory = [];
+
+async function onGlobalModuleChange() {
+  const modId = document.getElementById('moduleSelectGlobal').value;
+  pushToast(`Active sidepanel expert switched to: ${modId}`);
+  if (activeTab === 'vault')  loadVault();
+  if (activeTab === 'deltas') loadDeltas();
+  if (activeTab === 'stats')  refreshStats();
+}
+
+async function loadModulesUI() {
+  try {
+    const res = await fetch('/api/modules');
+    if (!res.ok) throw new Error('API Error');
+    const data = await res.json();
+    moeModules = data.modules || [];
+    defaultPipeline = data.default_pipeline || [];
+    
+    // Update global dropdown select if options changed
+    const globalSel = document.getElementById('moduleSelectGlobal');
+    const currentVal = globalSel.value;
+    globalSel.innerHTML = '';
+    moeModules.forEach(m => {
+      const opt = document.createElement('option');
+      opt.value = m.config.module_id;
+      opt.textContent = `${m.config.name} (${m.config.module_id})`;
+      if (m.config.module_id === currentVal) opt.selected = true;
+      globalSel.appendChild(opt);
+    });
+    
+    // Render pipeline strip badge flow
+    renderPipelineFlow();
+
+    // Render Modules List
+    renderModulesList();
+
+  } catch(e) {
+    document.getElementById('moeModulesList').innerHTML = `<div class="no-mem" style="color:var(--red);">Offline: ${e.message}</div>`;
+  }
+}
+
+function renderPipelineFlow() {
+  const flow = document.getElementById('moePipelineFlow');
+  flow.innerHTML = '';
+  
+  if (document.getElementById('moeAutoRoute').checked) {
+    flow.innerHTML = `<div class="moe-flow-badge active-exec" style="border-color:var(--g0); color:var(--g0);">🧠 Dynamic Router Deciding...</div>`;
+    return;
+  }
+  
+  if (!defaultPipeline.length) {
+    flow.innerHTML = `<div class="no-mem">// PIPELINE EMPTY</div>`;
+    return;
+  }
+  
+  defaultPipeline.forEach((pid, idx) => {
+    const m = moeModules.find(x => x.config.module_id === pid);
+    if (!m) return;
+    
+    const badge = document.createElement('div');
+    badge.className = 'moe-flow-badge';
+    badge.id = `flow-badge-${pid}`;
+    badge.textContent = m.config.name;
+    
+    flow.appendChild(badge);
+    
+    if (idx < defaultPipeline.length - 1) {
+      const arrow = document.createElement('span');
+      arrow.className = 'moe-flow-arrow';
+      arrow.innerHTML = '⚡';
+      flow.appendChild(arrow);
+    }
+  });
+}
+
+function getActivePipeline() {
+  if (document.getElementById('moeAutoRoute').checked) {
+    return [];
+  }
+  return defaultPipeline;
+}
+
+async function toggleAutoRoute(checked) {
+  pushToast(`Auto-Route ${checked ? 'enabled (Dynamic Routing)' : 'disabled (Static Pipeline)'}`);
+  renderPipelineFlow();
+}
+
+function renderModulesList() {
+  const container = document.getElementById('moeModulesList');
+  container.innerHTML = '';
+  
+  moeModules.forEach(m => {
+    const c = m.config;
+    const card = document.createElement('div');
+    card.className = 'moe-card';
+    
+    const isDefault = c.module_id === 'default-memory';
+    const isPipeline = defaultPipeline.includes(c.module_id);
+    const badgeClass = c.frozen ? 'frozen' : 'mutable';
+    const badgeText = c.frozen ? 'FROZEN' : 'MUTABLE';
+    
+    const deleteBtn = isDefault ? '' : `<button onclick="deleteModule('${c.module_id}')" class="btn-delete-module">🗑️ DELETE</button>`;
+    const pipelineCheckbox = `
+      <input type="checkbox" id="chk-${c.module_id}" ${isPipeline ? 'checked' : ''} onchange="togglePipelineModule('${c.module_id}', this.checked)" style="cursor:pointer;">
+    `;
+    
+    card.innerHTML = `
+      <div class="moe-card-header">
+        <div style="display:flex; align-items:center; gap:8px;">
+          ${pipelineCheckbox}
+          <span class="moe-card-title">${c.name}</span>
+        </div>
+        <span class="moe-badge ${badgeClass}" onclick="toggleFrozenState('${c.module_id}', ${!c.frozen})" style="cursor:pointer; user-select:none; transition: all 0.2s;" title="Click to toggle frozen status (frozen experts prevent synaptic decay)">${badgeText}</span>
+      </div>
+      <div class="moe-card-desc">${c.description}</div>
+      <div class="moe-card-metrics">
+        <div>SYNAPSES: <span class="moe-metric-val">${m.synapses_count}</span></div>
+        <div>LTP DECAY: <span class="moe-metric-val">${c.ltp_decay_rate.toFixed(2)}</span></div>
+        <div>STP DECAY: <span class="moe-metric-val">${c.stp_decay_rate.toFixed(2)}</span></div>
+      </div>
+      <div class="moe-card-actions">
+        <span style="font-size:0.6rem; color:var(--text-dim); font-family:var(--font-mono);">${c.module_id}</span>
+        ${deleteBtn}
+      </div>
+    `;
+    container.appendChild(card);
+  });
+}
+
+async function toggleFrozenState(moduleId, isFrozen) {
+  try {
+    pushToast(`${isFrozen ? 'Freezing' : 'Unfreezing'} expert module '${moduleId}'...`);
+    const res = await fetch(`/api/modules/${moduleId}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ frozen: isFrozen })
+    });
+    if (!res.ok) throw new Error('API modification failed');
+    const data = await res.json();
+    if (data.error) throw new Error(data.error);
+    
+    pushToast(`Successfully ${isFrozen ? 'froze' : 'unfroze'} '${moduleId}'!`);
+    loadModulesUI();
+  } catch(e) {
+    pushToast(`Failed to toggle state: ${e.message}`, true);
+    loadModulesUI();
+  }
+}
+
+async function togglePipelineModule(moduleId, checked) {
+  let newPipeline = [...defaultPipeline];
+  if (checked) {
+    if (!newPipeline.includes(moduleId)) newPipeline.push(moduleId);
+  } else {
+    newPipeline = newPipeline.filter(pid => pid !== moduleId);
+  }
+  
+  try {
+    const res = await fetch('/api/modules/pipeline', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(newPipeline)
+    });
+    if (!res.ok) throw new Error('Failed to update pipeline');
+    const data = await res.json();
+    if (data.error) throw new Error(data.error);
+    defaultPipeline = data.default_pipeline || [];
+    pushToast(`Pipeline updated: ${defaultPipeline.join(' -> ')}`);
+    renderPipelineFlow();
+  } catch(e) {
+    pushToast(`Error: ${e.message}`, true);
+    loadModulesUI();
+  }
+}
+
+async function deleteModule(moduleId) {
+  if (!confirm(`Are you sure you want to delete module '${moduleId}' permanently? All synapses will be scrubbed.`)) return;
+  try {
+    const res = await fetch(`/api/modules/${moduleId}`, { method: 'DELETE' });
+    if (!res.ok) throw new Error('API delete failed');
+    pushToast(`Module '${moduleId}' deleted successfully.`);
+    loadModulesUI();
+  } catch(e) {
+    pushToast(`Error: ${e.message}`, true);
+  }
+}
+
+// AI Module Builder Chat
+async function sendBuilderMessage() {
+  const input = document.getElementById('builderInput');
+  const text = input.value.trim();
+  if (!text) return;
+  
+  const messagesBox = document.getElementById('builderMessages');
+  
+  // Append User Message
+  const uDiv = document.createElement('div');
+  uDiv.className = 'moe-builder-msg user';
+  uDiv.textContent = text;
+  messagesBox.appendChild(uDiv);
+  input.value = '';
+  messagesBox.scrollTop = messagesBox.scrollHeight;
+  
+  // Add temporary loading bot message
+  const loadDiv = document.createElement('div');
+  loadDiv.className = 'moe-builder-msg bot';
+  loadDiv.innerHTML = 'Thinking<span class="thinking-dots"></span>';
+  messagesBox.appendChild(loadDiv);
+  messagesBox.scrollTop = messagesBox.scrollHeight;
+  
+  try {
+    const res = await fetch('/api/modules/builder', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message: text,
+        history: builderChatHistory
+      })
+    });
+    if (!res.ok) throw new Error('Network error');
+    const data = await res.json();
+    
+    // Remove loading message
+    loadDiv.remove();
+    
+    // Update builder chat history
+    builderChatHistory.push({ role: 'user', content: text });
+    builderChatHistory.push({ role: 'assistant', content: data.reply });
+    
+    // Append Bot Message
+    const bDiv = document.createElement('div');
+    bDiv.className = 'moe-builder-msg bot';
+    
+    // Format bot message (basic markdown and JSON capture)
+    let reply = data.reply;
+    
+    // Check if reply contains a deployable JSON block
+    const jsonMatch = reply.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+    let deployCardHtml = '';
+    if (jsonMatch) {
+      try {
+        let jsonStr = jsonMatch[1].replace(/\[?MODULE_READY\]?/gi, '').trim();
+        
+        // Robust cleaning: extract clean boundaries
+        const startIdx = jsonStr.indexOf('{');
+        if (startIdx !== -1) {
+          let endIdx = Math.max(jsonStr.lastIndexOf('}'), jsonStr.lastIndexOf(']'));
+          if (endIdx !== -1 && endIdx > startIdx) {
+            jsonStr = jsonStr.substring(startIdx, endIdx + 1);
+          }
+        }
+        
+        // Auto-repair: replace accidental closing bracket ] with curly brace } if it starts with {
+        if (jsonStr.startsWith('{') && jsonStr.endsWith(']')) {
+          jsonStr = jsonStr.slice(0, -1) + '}';
+        }
+        
+        // Strip inlined comments (e.g. // float threshold)
+        jsonStr = jsonStr.replace(/\/\/.*$/gm, '');
+        
+        // Strip trailing commas before closing braces/brackets
+        jsonStr = jsonStr.replace(/,\s*([\}\]])/g, '$1');
+        
+        const config = JSON.parse(jsonStr);
+        const configId = 'mod_' + Math.random().toString(36).substring(2, 9);
+        pendingModules[configId] = config;
+        deployCardHtml = `
+          <div class="moe-deploy-card">
+            <strong style="color:var(--g0);">📦 EXPERT READY TO DEPLOY</strong><br/>
+            Name: ${config.name || 'Unnamed'}<br/>
+            ID: ${config.module_id || 'unnamed-expert'}<br/>
+            Directives: ${config.system_directive ? config.system_directive.slice(0, 40) + '...' : 'None'}<br/>
+            <button onclick="deployBuiltModule('${configId}')" style="background:var(--g0); border:none; color:#000; font-family:var(--font-mono); font-size:0.65rem; padding:4px 8px; border-radius:3px; margin-top:6px; cursor:pointer; font-weight:bold;">⚡ DEPLOY EXPERT</button>
+          </div>
+        `;
+      } catch(je) {
+        console.warn("JSON parsing in architect reply failed:", je);
+      }
+    }
+    
+    bDiv.innerHTML = `<div style="white-space:pre-wrap;">${reply}</div>` + deployCardHtml;
+    messagesBox.appendChild(bDiv);
+    messagesBox.scrollTop = messagesBox.scrollHeight;
+    
+  } catch(e) {
+    if (loadDiv) loadDiv.remove();
+    const bDiv = document.createElement('div');
+    bDiv.className = 'moe-builder-msg bot';
+    bDiv.style.borderColor = 'var(--red)';
+    bDiv.textContent = `Architect failed: ${e.message}`;
+    messagesBox.appendChild(bDiv);
+    messagesBox.scrollTop = messagesBox.scrollHeight;
+  }
+}
+
+async function deployBuiltModule(configId) {
+  try {
+    const config = pendingModules[configId];
+    if (!config) throw new Error('Configuration not found');
+    pushToast(`Deploying expert module '${config.name}'...`);
+    const res = await fetch('/api/modules', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(config)
+    });
+    if (!res.ok) throw new Error('API creation failed');
+    const data = await res.json();
+    if (data.error) throw new Error(data.error);
+    
+    pushToast(`Successfully deployed '${config.name}'!`);
+    loadModulesUI();
+    
+    // Append system message in builder chat confirming deployment
+    const messagesBox = document.getElementById('builderMessages');
+    const sDiv = document.createElement('div');
+    sDiv.className = 'moe-builder-msg bot';
+    sDiv.style.borderLeftColor = 'var(--g0)';
+    sDiv.innerHTML = `<span style="color:var(--g0);">✔️ SUCCESS:</span> Module '${config.name}' deployed, loaded in PyTorch memory, and active.`;
+    messagesBox.appendChild(sDiv);
+    messagesBox.scrollTop = messagesBox.scrollHeight;
+    
+  } catch(e) {
+    pushToast(`Deployment Failed: ${e.message}`, true);
+  }
+}
+
+function clearBuilderChat() {
+  builderChatHistory = [];
+  document.getElementById('builderMessages').innerHTML = '<div class="moe-builder-msg bot">Greetings. I am the ERN Expert Architect. Converse with me to design and customize a new expert memory module, or configure parameter thresholds.</div>';
+}
+
 loadModels();
+loadModulesUI();
 refreshStats();
 setInterval(() => {
   sparkData.push(Math.random() * 0.05);

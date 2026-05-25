@@ -463,6 +463,11 @@ def patch_module_endpoint(module_id: str, req: ModulePatchRequest):
         if module_id in manager.active_modules:
             manager.active_modules[module_id].frozen = req.frozen
             
+    if req.mcp_enabled is not None:
+        config["mcp_enabled"] = req.mcp_enabled
+        if module_id in manager.active_modules:
+            manager.active_modules[module_id].mcp_enabled = req.mcp_enabled
+            
     if req.ltp_decay_rate is not None:
         config["ltp_decay_rate"] = req.ltp_decay_rate
         if module_id in manager.active_modules:

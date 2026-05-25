@@ -263,6 +263,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                     "memory_count": m.get("synapses_count", 0),  # Fix #8: correct key
                 }
                 for m in modules
+                if m["config"].get("mcp_enabled", True)  # Filter by mcp_enabled
             ]
             return [TextContent(type="text", text=json.dumps({
                 "module_count": len(topology),
@@ -399,7 +400,8 @@ async def list_prompts() -> list[Prompt]:
             name        = f"constitution_{m['config']['module_id']}",
             description = f"Frozen constitution: {m['config']['name']} — {m['config'].get('description', '')}",
         )
-        for m in modules if m["config"].get("frozen", False)
+        for m in modules
+        if m["config"].get("frozen", False) and m["config"].get("mcp_enabled", True)
     ]
     return prompts
 
@@ -425,8 +427,8 @@ async def get_prompt(name: str, arguments: dict[str, Any] | None) -> GetPromptRe
         modules = {m["config"]["module_id"]: m for m in r.json().get("modules", [])}
 
     mod = modules.get(module_id)
-    if not mod:
-        directive = f"[Constitution '{module_id}' not found]"
+    if not mod or not mod["config"].get("mcp_enabled", True):
+        directive = f"[Constitution '{module_id}' not found or not exposed to MCP]"
         desc      = "Unknown constitution"
     else:
         directive = mod["config"].get("system_directive", "(no directive set)")

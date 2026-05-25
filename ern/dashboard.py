@@ -407,6 +407,16 @@ select option { background: var(--bg); }
   border: 1px solid rgba(0,204,255,0.5);
   color: #00ccff;
 }
+.moe-badge.mcp-on {
+  background: rgba(0,255,136,0.12);
+  border: 1px solid rgba(0,255,136,0.45);
+  color: var(--g0);
+}
+.moe-badge.mcp-off {
+  background: rgba(255,58,58,0.12);
+  border: 1px solid rgba(255,58,58,0.45);
+  color: var(--red);
+}
 .moe-card-desc {
   font-size: 0.75rem;
   color: var(--g2);
@@ -1761,7 +1771,10 @@ function renderModulesList() {
           ${pipelineCheckbox}
           <span class="moe-card-title">${c.name}</span>
         </div>
-        <span class="moe-badge ${badgeClass}" onclick="toggleFrozenState('${c.module_id}', ${!c.frozen})" style="cursor:pointer; user-select:none; transition: all 0.2s;" title="Click to toggle frozen status (frozen experts prevent synaptic decay)">${badgeText}</span>
+        <div style="display:flex; gap:6px; align-items:center;">
+          <span class="moe-badge ${badgeClass}" onclick="toggleFrozenState('${c.module_id}', ${!c.frozen})" style="cursor:pointer; user-select:none; transition: all 0.2s;" title="Click to toggle frozen status (frozen experts prevent synaptic decay)">${badgeText}</span>
+          <span class="moe-badge ${c.mcp_enabled !== false ? 'mcp-on' : 'mcp-off'}" onclick="toggleMcpState('${c.module_id}', ${c.mcp_enabled === false})" style="cursor:pointer; user-select:none; transition: all 0.2s;" title="Expose/Hide this expert to external MCP agents (like Zed)">${c.mcp_enabled !== false ? 'MCP' : 'NO MCP'}</span>
+        </div>
       </div>
       <div class="moe-card-desc">${c.description}</div>
       <div class="moe-card-metrics">
@@ -1794,6 +1807,26 @@ async function toggleFrozenState(moduleId, isFrozen) {
     loadModulesUI();
   } catch(e) {
     pushToast(`Failed to toggle state: ${e.message}`, true);
+    loadModulesUI();
+  }
+}
+
+async function toggleMcpState(moduleId, isMcpEnabled) {
+  try {
+    pushToast(`${isMcpEnabled ? 'Enabling' : 'Disabling'} MCP for expert module '${moduleId}'...`);
+    const res = await fetch(`/api/modules/${moduleId}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mcp_enabled: isMcpEnabled })
+    });
+    if (!res.ok) throw new Error('API modification failed');
+    const data = await res.json();
+    if (data.error) throw new Error(data.error);
+    
+    pushToast(`Successfully ${isMcpEnabled ? 'exposed' : 'hidden'} '${moduleId}' ${isMcpEnabled ? 'to' : 'from'} MCP!`);
+    loadModulesUI();
+  } catch(e) {
+    pushToast(`Failed to toggle MCP state: ${e.message}`, true);
     loadModulesUI();
   }
 }

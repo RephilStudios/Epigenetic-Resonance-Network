@@ -35,6 +35,7 @@ class ModuleConfig(BaseModel):
     name: str
     description: str = ""
     frozen: bool = False
+    mcp_enabled: bool = True  # Expose to external MCP clients (like Zed IDE)
     ltp_decay_rate: float = 0.95
     stp_decay_rate: float = 0.80
     sleep_threshold: float = 0.10
@@ -43,6 +44,7 @@ class ModuleConfig(BaseModel):
 
 class ModulePatchRequest(BaseModel):
     frozen: Optional[bool] = None
+    mcp_enabled: Optional[bool] = None
     ltp_decay_rate: Optional[float] = None
     stp_decay_rate: Optional[float] = None
 

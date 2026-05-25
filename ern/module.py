@@ -25,6 +25,7 @@ class ERNModule:
         self.name = config["name"]
         self.description = config.get("description", "")
         self.frozen = config.get("frozen", False)
+        self.mcp_enabled = config.get("mcp_enabled", True)
         
         self.ltp_decay_rate = config.get("ltp_decay_rate", 0.95)
         self.stp_decay_rate = config.get("stp_decay_rate", 0.80)

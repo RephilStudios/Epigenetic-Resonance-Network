@@ -103,7 +103,7 @@ def run_memory_judge(user_message: str, prior_memories: str = "", target_module_
             tags, memory_type = _classify_message(user_message)
             tags = f"User Message, Auto-Captured, {tags}"
             target_mod.encode_hebbian(
-                text=user_message[:500],
+                text=user_message,
                 tags=tags,
                 memory_type=memory_type
             )
@@ -117,7 +117,7 @@ def run_memory_judge(user_message: str, prior_memories: str = "", target_module_
                 tags, memory_type = _classify_message(user_message)
                 tags = f"User Message, Exception-Fallback, {tags}"
                 target_mod.encode_hebbian(
-                    text=user_message[:500],
+                    text=user_message,
                     tags=tags,
                     memory_type=memory_type
                 )

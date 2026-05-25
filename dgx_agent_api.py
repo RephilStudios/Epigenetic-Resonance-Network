@@ -112,7 +112,7 @@ def process_chat(req: ChatRequest, background_tasks: BackgroundTasks):
         mod_results_count = 0
         for q in search_queries:
             q_mems = mod.retrieve(
-                q, top_k=3, threshold=req.focus_threshold, decay=False,
+                q, top_k=5, threshold=req.focus_threshold, decay=False,
                 tags_filter=req.tags_filter, memory_type_filter=req.memory_type_filter
             )
             for m in q_mems:

@@ -694,6 +694,61 @@ input:checked + .slider:before {
   </div>
 </div>
 
+<!-- Beautiful Memory Viewer Modal -->
+<div id="memoryViewerModal" class="modal-overlay">
+  <div class="modal-content" style="background: var(--bg2); border: 1px solid var(--border); border-radius: 8px; width: 90%; max-width: 700px; padding: 25px; box-shadow: 0 20px 40px rgba(0,0,0,0.6); font-family: var(--font-hud); display: flex; flex-direction: column; gap: 15px; max-height: 85vh; overflow-y: auto;">
+    <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border); padding-bottom: 10px; margin-bottom: 5px;">
+      <span style="font-size: 0.95rem; font-weight: bold; color: var(--g0); letter-spacing: 0.05em; display: flex; align-items: center; gap: 6px;">👁️ VIEW MEMORY DETAILS</span>
+      <span onclick="closeMemoryViewerModal()" style="color: var(--text-dim); cursor: pointer; font-size: 1.2rem; font-weight: bold;" onmouseover="this.style.color='var(--red)'" onmouseout="this.style.color='var(--text-dim)'">&times;</span>
+    </div>
+    
+    <div style="display: flex; flex-direction: column; gap: 15px;">
+      <div style="display: flex; gap: 15px; flex-wrap: wrap;">
+        <div style="flex: 1; min-width: 200px;">
+          <label style="font-size: 0.65rem; color: var(--g1); font-family: var(--font-mono); display: block; margin-bottom: 4px;">MEMORY ID:</label>
+          <div id="modalMemId" style="background: var(--bg3); border: 1px solid var(--border); padding: 8px; font-size: 0.72rem; border-radius: 4px; font-family: var(--font-mono); word-break: break-all; color: var(--text-dim);"></div>
+        </div>
+        <div style="flex: 1; min-width: 150px;">
+          <label style="font-size: 0.65rem; color: var(--g1); font-family: var(--font-mono); display: block; margin-bottom: 4px;">MODULE ID:</label>
+          <div id="modalMemModule" style="background: var(--bg3); border: 1px solid var(--border); padding: 8px; font-size: 0.75rem; border-radius: 4px; font-family: var(--font-mono); color: var(--g0); font-weight: bold;"></div>
+        </div>
+      </div>
+
+      <div style="display: flex; gap: 15px; flex-wrap: wrap;">
+        <div style="flex: 1; min-width: 150px;">
+          <label style="font-size: 0.65rem; color: var(--g1); font-family: var(--font-mono); display: block; margin-bottom: 4px;">ENERGY TENSORS:</label>
+          <div id="modalMemEnergy" style="background: var(--bg3); border: 1px solid var(--border); padding: 8px; font-size: 0.75rem; border-radius: 4px; font-family: var(--font-mono); color: var(--text);"></div>
+        </div>
+        <div style="flex: 1; min-width: 150px;">
+          <label style="font-size: 0.65rem; color: var(--g1); font-family: var(--font-mono); display: block; margin-bottom: 4px;">TIMESTAMP:</label>
+          <div id="modalMemDate" style="background: var(--bg3); border: 1px solid var(--border); padding: 8px; font-size: 0.75rem; border-radius: 4px; font-family: var(--font-mono); color: var(--text-dim);"></div>
+        </div>
+      </div>
+
+      <div>
+        <label style="font-size: 0.65rem; color: var(--g1); font-family: var(--font-mono); display: block; margin-bottom: 4px;">TAGS & CATEGORIES:</label>
+        <div id="modalMemTags" style="background: var(--bg3); border: 1px solid var(--border); padding: 8px; font-size: 0.75rem; border-radius: 4px; font-family: var(--font-mono); color: var(--g3); font-weight: bold;"></div>
+      </div>
+
+      <div>
+        <label style="font-size: 0.65rem; color: var(--g1); font-family: var(--font-mono); display: block; margin-bottom: 4px;">FULL MEMORY TEXT (UNTRUNCATED):</label>
+        <div id="modalMemText" style="background: var(--bg3); border: 1px solid var(--border); padding: 12px; font-size: 0.82rem; border-radius: 4px; font-family: var(--font-mono); white-space: pre-wrap; word-break: break-word; color: #fff; max-height: 250px; overflow-y: auto; line-height: 1.5; border-left: 3px solid var(--g0);"></div>
+      </div>
+
+      <div id="modalMemImageContainer" style="display: none;">
+        <label style="font-size: 0.65rem; color: var(--g1); font-family: var(--font-mono); display: block; margin-bottom: 4px;">ASSOCIATED IMAGE ARCHIVE:</label>
+        <div style="border: 1px solid var(--border); border-radius: 4px; overflow: hidden; display: inline-block; background: var(--bg3); cursor: pointer;" onclick="window.open(document.getElementById('modalMemImg').src, '_blank')">
+          <img id="modalMemImg" src="" style="max-width: 100%; max-height: 200px; display: block; filter: brightness(0.92) contrast(1.05);">
+        </div>
+      </div>
+    </div>
+    
+    <div style="display: flex; justify-content: flex-end; margin-top: 10px; border-top: 1px solid var(--border); padding-top: 15px;">
+      <button onclick="closeMemoryViewerModal()" style="background: var(--g0); border: none; color: #000; padding: 6px 20px; font-size: 0.75rem; border-radius: 4px; cursor: pointer; font-weight: bold; font-family: var(--font-mono); letter-spacing: 0.05em;" onmouseover="this.style.boxShadow='0 0 10px var(--g0)'" onmouseout="this.style.boxShadow='none'">DISMISS</button>
+    </div>
+  </div>
+</div>
+
 <div id="topbar">
   <div class="brand">ERN <span>//</span> DGX</div>
   <div class="main-tabs" style="display:flex; height:100%; margin-left:24px; border-left: 1px solid var(--border); padding-left: 8px;">
@@ -885,6 +940,7 @@ console.log("ERN UI Booting...");
 let chatHistory    = [];
 let queryCount     = 0;
 let lastResonances = [];
+let lastRetrievedMemories = [];
 let activeTab      = 'recall';
 let activeMainView = 'chat';
 let useAgenticSearch = true;
@@ -974,13 +1030,16 @@ function renderVaultList(mems) {
     if (mType === 'question') typeBadgeColor = '#ffb300';
     if (mType === 'instruction') typeBadgeColor = '#00ff88';
     const typeBadge = `<span style="display: inline-block; white-space: nowrap; font-size:0.55rem; background: rgba(0,0,0,0.3); border: 1px solid ${typeBadgeColor}; color: ${typeBadgeColor}; padding: 1px 5px; border-radius: 3px; margin-left: 6px; font-family: var(--font-mono); text-transform: uppercase;">${mType}</span>`;
-    
+    const previewText = m.text.length > 500 ? m.text.slice(0, 500) + '...' : m.text;
     card.innerHTML = `<div class="mc-tags">${m.tags}${moduleBadge}${typeBadge}</div>` +
-                     `<div style="word-break: break-word;">${m.text}</div>` +
+                     `<div style="word-break: break-word; line-height: 1.4;">${previewText}</div>` +
                      imgHtml +
                      `<div class="mc-energy">${m.energy.toFixed(3)} LTP | ${m.stp_energy ? m.stp_energy.toFixed(3) : '0.000'} STP</div>` +
                      `<div class="mc-date" style="font-size: 0.58rem; color: var(--text-dim); margin-top: 4px; font-family: var(--font-hud);">${formattedDate}</div>` +
-                     `<button class="mc-forget" onclick="forgetMemory('${m.memory_id}', '${m.module_id || ''}')">FORGET</button>`;
+                     `<div style="display:flex; gap:6px; margin-top: 6px; width: 100%;">` +
+                     `<button style="background: rgba(0,255,136,0.05); border: 1px solid var(--g3); color: var(--g0); font-family: var(--font-hud); font-size: 0.55rem; padding: 6px; cursor: pointer; flex: 1; letter-spacing: 0.08em; transition: all 0.15s; outline: none; text-transform: uppercase;" onclick="viewMemoryDetails('${m.memory_id}')">VIEW DETAILS</button>` +
+                     `<button style="background: rgba(255,0,0,0.05); border: 1px solid var(--red); color: var(--text-dim); font-family: var(--font-hud); font-size: 0.55rem; padding: 6px; cursor: pointer; flex: 1; letter-spacing: 0.08em; transition: all 0.15s; outline: none; text-transform: uppercase;" onmouseover="this.style.color='var(--red)'; this.style.textShadow='0 0 6px var(--red)';" onmouseout="this.style.color='var(--text-dim)'; this.style.textShadow='none';" onclick="forgetMemory('${m.memory_id}', '${m.module_id || ''}')">FORGET</button>` +
+                     `</div>`;
     scroll.appendChild(card);
   });
 }
@@ -1030,6 +1089,46 @@ async function forgetMemory(memory_id, moduleId = null) {
   } catch (e) {
     pushToast(`Forget failed: ${e.message}`);
   }
+}
+
+function viewMemoryDetails(memoryId) {
+  let mem = vaultMemories.find(m => m.memory_id === memoryId);
+  if (!mem) {
+    mem = lastRetrievedMemories.find(m => m.memory_id === memoryId);
+  }
+  if (!mem) {
+    pushToast("Memory details not found in active session cache.", true);
+    return;
+  }
+  
+  document.getElementById('modalMemId').textContent = mem.memory_id;
+  document.getElementById('modalMemModule').textContent = mem.module_id || document.getElementById('moduleSelectGlobal').value;
+  document.getElementById('modalMemTags').textContent = mem.tags || 'No tags associated';
+  document.getElementById('modalMemText').textContent = mem.text;
+  
+  const ltp = mem.energy !== undefined ? mem.energy.toFixed(3) : '0.000';
+  const stp = mem.stp_energy !== undefined ? mem.stp_energy.toFixed(3) : '0.000';
+  const resonance = mem.resonance !== undefined ? ` | ${mem.resonance.toFixed(3)} Resonance (R)` : '';
+  document.getElementById('modalMemEnergy').textContent = `${ltp} LTP | ${stp} STP${resonance}`;
+  
+  const formattedDate = mem.timestamp ? new Date(mem.timestamp * 1000).toLocaleString() : 'Date Unknown';
+  document.getElementById('modalMemDate').textContent = formattedDate;
+  
+  const imgCont = document.getElementById('modalMemImageContainer');
+  const imgElem = document.getElementById('modalMemImg');
+  if (mem.image_url) {
+    imgElem.src = mem.image_url;
+    imgCont.style.display = 'block';
+  } else {
+    imgElem.src = '';
+    imgCont.style.display = 'none';
+  }
+  
+  document.getElementById('memoryViewerModal').style.display = 'flex';
+}
+
+function closeMemoryViewerModal() {
+  document.getElementById('memoryViewerModal').style.display = 'none';
 }
 
 // ── Neural canvas ────────────────────────────────
@@ -1451,6 +1550,7 @@ async function send() {
     sparkData.push(avgRes);
     sparkData = sparkData.slice(-80);
     lastResonances = resValues;
+    lastRetrievedMemories = memories;
 
     document.getElementById('sc-resonance').textContent = avgRes > 0 ? avgRes.toFixed(3) : '—';
 
@@ -1481,13 +1581,17 @@ async function send() {
         if (mType === 'instruction') typeBadgeColor = '#00ff88';
         const typeBadge = `<span style="display: inline-block; white-space: nowrap; font-size:0.55rem; background: rgba(0,0,0,0.3); border: 1px solid ${typeBadgeColor}; color: ${typeBadgeColor}; padding: 1px 5px; border-radius: 3px; margin-left: 6px; font-family: var(--font-mono); text-transform: uppercase;">${mType}</span>`;
         
+        const previewText = m.text.length > 500 ? m.text.slice(0, 500) + '...' : m.text;
         card.innerHTML = `<div class="mc-tags">[Expert: ${m.module_name || 'default-memory'}] | ${m.tags}${typeBadge}</div>` +
-                         `<div style="word-break: break-word;">${m.text}</div>` +
+                         `<div style="word-break: break-word; line-height: 1.4;">${previewText}</div>` +
                          imgHtml +
                          `<div class="mc-resonance">${m.resonance.toFixed(3)} R</div>` +
                          `<div class="mc-energy">${m.energy ? m.energy.toFixed(3) : '0.000'} LTP | ${m.stp_energy ? m.stp_energy.toFixed(3) : '0.000'} STP</div>` +
                          `<div class="mc-date" style="font-size: 0.58rem; color: var(--text-dim); margin-top: 4px; font-family: var(--font-hud);">${formattedDate}</div>` +
-                         `<button class="mc-forget" onclick="forgetMemory('${m.memory_id}', '${m.module_id || 'default-memory'}')">FORGET</button>`;
+                         `<div style="display:flex; gap:6px; margin-top: 6px; width: 100%;">` +
+                         `<button style="background: rgba(0,255,136,0.05); border: 1px solid var(--g3); color: var(--g0); font-family: var(--font-hud); font-size: 0.55rem; padding: 6px; cursor: pointer; flex: 1; letter-spacing: 0.08em; transition: all 0.15s; outline: none; text-transform: uppercase;" onclick="viewMemoryDetails('${m.memory_id}')">VIEW DETAILS</button>` +
+                         `<button style="background: rgba(255,0,0,0.05); border: 1px solid var(--red); color: var(--text-dim); font-family: var(--font-hud); font-size: 0.55rem; padding: 6px; cursor: pointer; flex: 1; letter-spacing: 0.08em; transition: all 0.15s; outline: none; text-transform: uppercase;" onmouseover="this.style.color='var(--red)'; this.style.textShadow='0 0 6px var(--red)';" onmouseout="this.style.color='var(--text-dim)'; this.style.textShadow='none';" onclick="forgetMemory('${m.memory_id}', '${m.module_id || 'default-memory'}')">FORGET</button>` +
+                         `</div>`;
         mBox.appendChild(card);
       });
     } else {

@@ -85,7 +85,7 @@ def _direct_save_message(user_message: str, target_module_id: str) -> None:
             print(f"[DIRECT SAVE] ERROR: Could not resolve module '{target_module_id}'")
             return
         tags, memory_type = _classify_message(stripped)
-        mem_id = mod.encode_hebbian(text=stripped[:500], tags=tags, memory_type=memory_type)
+        mem_id = mod.encode_hebbian(text=stripped, tags=tags, memory_type=memory_type)
         print(f"[DIRECT SAVE] ✓ Saved to '{mod.name}' | tags: {tags} | type: {memory_type} | id={mem_id}")
     except Exception as e:
         print(f"[DIRECT SAVE] EXCEPTION: {e}")

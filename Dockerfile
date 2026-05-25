@@ -13,5 +13,6 @@ COPY dgx_agent_api.py .
 RUN mkdir -p /app/ern_state
 
 EXPOSE 8000
+EXPOSE 8001
 
 CMD ["python", "dgx_agent_api.py"]

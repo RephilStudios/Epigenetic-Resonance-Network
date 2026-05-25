@@ -8,3 +8,6 @@ soxr
 pypdf
 python-multipart
 pillow
+mcp[cli]
+sse-starlette
+httpx

@@ -1,0 +1,10 @@
+{
+  "context_servers": {
+    "ern-memory-network": {
+      "transport": {
+        "type": "sse",
+        "url": "http://localhost:8001/mcp/sse"
+      }
+    }
+  }
+}

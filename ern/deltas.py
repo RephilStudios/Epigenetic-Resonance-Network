@@ -6,11 +6,12 @@ from dataclasses import dataclass
 from typing import List, Optional, Dict, Any
 
 class DeltaOp(str, Enum):
-    ENCODE   = "ENCODE"    # new node appended
-    DECAY    = "DECAY"     # per-retrieve energy decay across all nodes
-    BOOST    = "BOOST"     # Hebbian boost on specific retrieved indices
-    SLEEP    = "SLEEP"     # REM pruning: bulk energy decay + row removal
-    RESTORE  = "RESTORE"   # state loaded from disk (baseline snapshot)
+    ENCODE             = "ENCODE"             # new node appended
+    DECAY              = "DECAY"              # per-retrieve energy decay across all nodes
+    BOOST              = "BOOST"              # Hebbian boost on specific retrieved indices
+    SLEEP              = "SLEEP"              # REM pruning: bulk energy decay + row removal
+    RESTORE            = "RESTORE"            # state loaded from disk (baseline snapshot)
+    DEEP_RECALL_BOOST  = "DEEP_RECALL_BOOST"  # transactional hop boost; reversible via rollback_chain()
 
 @dataclass
 class TensorDelta:
@@ -31,9 +32,10 @@ class TensorDelta:
     # DECAY
     decay_factor  : Optional[float]        = None
 
-    # BOOST
-    boost_indices : Optional[List[int]]    = None
-    boost_amounts : Optional[List[float]]  = None
+    # BOOST / DEEP_RECALL_BOOST
+    boost_indices    : Optional[List[int]]   = None
+    boost_amounts    : Optional[List[float]] = None
+    recall_chain_id  : Optional[str]         = None  # groups hops of one deep recall chain
 
     # SLEEP
     sleep_decay_factor  : Optional[float]       = None
@@ -48,6 +50,9 @@ class TensorDelta:
             return f"{base} | factor={self.decay_factor:.4f}"
         if self.op == DeltaOp.BOOST:
             return f"{base} | nodes={self.boost_indices} Δe={[round(a,3) for a in self.boost_amounts]}"
+        if self.op == DeltaOp.DEEP_RECALL_BOOST:
+            chain = (self.recall_chain_id or "")[:8]
+            return f"{base} | chain={chain} nodes={self.boost_indices} Δe={[round(a,3) for a in (self.boost_amounts or [])]}"
         if self.op == DeltaOp.SLEEP:
             return f"{base} | pruned={len(self.pruned_indices or [])} nodes"
         if self.op == DeltaOp.RESTORE:
@@ -81,6 +86,35 @@ class TensorDeltaStack:
             "oldest" : self.stack[0].timestamp  if self.stack else None,
             "newest" : self.stack[-1].timestamp if self.stack else None,
         }
+
+    def rollback_chain(self, engine: "ERNModule", chain_id: str) -> int:
+        """
+        LTD Pain Signal: atomically reverses all DEEP_RECALL_BOOST deltas tagged
+        with chain_id by subtracting the stored delta_e from each node's energy.
+        The node vectors and vault entries are NEVER deleted — only the hallucinated
+        energy pathway is severed.  Returns the count of deltas reversed.
+        """
+        import torch
+        undone = 0
+        new_stack = list(self.stack)
+        for i in reversed(range(len(new_stack))):
+            d = new_stack[i]
+            if d.op == DeltaOp.DEEP_RECALL_BOOST and d.recall_chain_id == chain_id:
+                if d.boost_indices and d.boost_amounts:
+                    for idx, amt in zip(d.boost_indices, d.boost_amounts):
+                        if 0 <= idx < engine.memory_bank.size(0):
+                            # Exact inverse: subtract the stored positive delta
+                            engine.energies[idx] = torch.clamp(
+                                engine.energies[idx] - amt,
+                                min=0.0,
+                            )
+                new_stack.pop(i)
+                undone += 1
+        self.stack = new_stack
+        if undone > 0:
+            engine._save_state(debounce=False)
+        print(f"[LTD][rollback_chain] Reversed {undone} DEEP_RECALL_BOOST delta(s) for chain={chain_id[:8]}")
+        return undone
 
     def save(self, path: str):
         torch.save(self.stack, path)

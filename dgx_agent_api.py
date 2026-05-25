@@ -5,6 +5,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import uuid
 import time
+import asyncio
 import datetime
 import requests
 import uvicorn
@@ -22,7 +23,8 @@ from ern.deltas import TensorDelta, DeltaOp
 from ern.config import SAVE_DIR, OLLAMA_URL, DEFAULT_MODEL, JUDGE_MODEL, VISION_MODEL
 from ern.models import (
     Message, ChatRequest, ChatResponse, MemoryStoreRequest,
-    ModuleConfig, ModulePatchRequest, BuilderRequest
+    ModuleConfig, ModulePatchRequest, BuilderRequest,
+    DeepRecallRequest, DeepRecallResponse,
 )
 from ern.module import manager
 from ern.helpers import (
@@ -30,6 +32,7 @@ from ern.helpers import (
     format_temporal_memory_block
 )
 from ern.routing import route_query_to_modules, agentic_search_planner
+from ern.deep_recall import deep_recall
 from ern.extraction import (
     run_memory_judge, extract_text_from_pdf, run_pdf_extractor_chunk,
     process_pdf_background, process_image_background
@@ -610,6 +613,125 @@ def rollback_deltas(n: int = 1, module_id: str = "default-memory"):
         "status"       : f"Rolled back {undone} delta(s).",
         "engine_size"  : mod.memory_bank.size(0),
         "stack_depth"  : len(mod.deltas.stack),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Deep Recall endpoints (Feature 1 + 2)
+# ---------------------------------------------------------------------------
+
+@app.post("/api/recall/deep", response_model=DeepRecallResponse)
+async def deep_recall_endpoint(req: DeepRecallRequest):
+    """
+    Iterative multi-hop deep recall with Hebbian LTP boosting.
+    Returns a recall_chain_id that can later be committed or rolled back via LTD.
+    """
+    # Resolve pipeline
+    active_pipeline = manager.registry.get("default_pipeline", ["default-memory"])
+    if req.pipeline:
+        pipeline_ids = [pid for pid in req.pipeline if pid in manager.registry["modules"]]
+    else:
+        pipeline_ids = [pid for pid in active_pipeline if pid in manager.registry["modules"]]
+    if not pipeline_ids:
+        pipeline_ids = ["default-memory"]
+
+    modules    = [m for pid in pipeline_ids if (m := manager.get_module(pid)) is not None]
+    module_ids = [pid for pid in pipeline_ids if manager.get_module(pid) is not None]
+
+    if not modules:
+        return DeepRecallResponse(
+            recall_chain_id="",
+            original_query=req.query,
+            final_memories=[],
+            hop_log=[{"status": "error", "detail": "No valid modules resolved."}],
+            boosted_nodes=[],
+        )
+
+    # Run the hop loop in a thread executor to avoid blocking uvicorn's event loop
+    loop   = asyncio.get_event_loop()
+    result = await loop.run_in_executor(
+        None,
+        lambda: deep_recall(
+            query            = req.query,
+            modules          = modules,
+            module_ids       = module_ids,
+            n_hops           = req.n_hops,
+            top_k_candidates = req.top_k_candidates,
+            hop_ltp_boost    = req.hop_ltp_boost,
+        ),
+    )
+
+    return DeepRecallResponse(
+        recall_chain_id = result.recall_chain_id,
+        original_query  = result.original_query,
+        final_memories  = result.final_memories,
+        hop_log         = result.hop_log,
+        boosted_nodes   = result.boosted_nodes,
+    )
+
+
+@app.post("/api/recall/rollback/{chain_id}")
+def trigger_ltd_rollback(chain_id: str, module_id: str = "default-memory"):
+    """
+    LTD Pain Signal — atomically reverses all DEEP_RECALL_BOOST deltas tagged
+    with chain_id by subtracting their stored delta_e from the energy tensors.
+    Node vectors and vault entries are NEVER deleted; only the hallucinated
+    energy pathway is severed.
+    """
+    mod = manager.get_module(module_id)
+    if not mod:
+        return {"error": f"Module '{module_id}' not found.", "status": "failed"}
+
+    # Check chain exists before attempting rollback
+    from ern.deltas import DeltaOp
+    chain_deltas = [
+        d for d in mod.deltas.stack
+        if d.op == DeltaOp.DEEP_RECALL_BOOST
+        and getattr(d, "recall_chain_id", None) == chain_id
+    ]
+    if not chain_deltas:
+        return {
+            "error"   : f"Chain '{chain_id}' not found in module '{module_id}' delta stack "
+                        "(already rolled back or never committed to this module).",
+            "status"  : "not_found",
+        }
+
+    undone = mod.deltas.rollback_chain(mod, chain_id)
+    return {
+        "status"          : "LTD rollback complete. Hallucinated neural bridge severed.",
+        "chain_id"        : chain_id,
+        "deltas_reversed" : undone,
+        "engine_size"     : mod.memory_bank.size(0),   # Unchanged — no nodes deleted
+        "stack_depth"     : len(mod.deltas.stack),
+    }
+
+
+@app.post("/api/recall/commit/{chain_id}")
+def commit_recall_chain(chain_id: str, module_id: str = "default-memory"):
+    """
+    Permanently commit a recall chain — re-tags DEEP_RECALL_BOOST deltas as
+    standard BOOST ops so they are no longer eligible for chain rollback.
+    Call this when the downstream code execution succeeds.
+    """
+    mod = manager.get_module(module_id)
+    if not mod:
+        return {"error": f"Module '{module_id}' not found.", "status": "failed"}
+
+    from ern.deltas import DeltaOp
+    committed = 0
+    for d in mod.deltas.stack:
+        if d.op == DeltaOp.DEEP_RECALL_BOOST and getattr(d, "recall_chain_id", None) == chain_id:
+            d.op              = DeltaOp.BOOST
+            d.recall_chain_id = None
+            committed        += 1
+
+    if committed > 0:
+        mod._save_state(debounce=False)
+
+    return {
+        "status"    : "Chain committed. LTP boosts are now permanent.",
+        "chain_id"  : chain_id,
+        "committed" : committed,
     }
 
 

@@ -1,9 +1,10 @@
 services:
+
+  # ── FastAPI ERN Agent (port 8000) ─────────────────────────────────────────
   ern-agent:
     build: .
     container_name: ern-agent-api
-    # Share the host's network stack so the container can reach
-    # Ollama at localhost:11434 directly without routing issues
+    # Share the host network so the container reaches Ollama at localhost:11434
     network_mode: host
     ipc: host
     ulimits:
@@ -15,6 +16,7 @@ services:
       - ./dgx_agent_api.py:/app/dgx_agent_api.py
     environment:
       - OLLAMA_URL=http://localhost:11434/api/chat
+
     deploy:
       resources:
         reservations:
@@ -22,3 +24,19 @@ services:
             - driver: nvidia
               device_ids: ['0']
               capabilities: [gpu]
+
+  # ── MCP SSE Server (port 8001) ────────────────────────────────────────────
+  ern-mcp:
+    build: .
+    container_name: ern-mcp-server
+    network_mode: host          # reaches ern-agent at localhost:8000 directly
+    ipc: host
+    volumes:
+      - ./ern:/app/ern          # live-reload the ern package without rebuild
+    environment:
+      - ERN_API_BASE=http://localhost:8000
+      - MCP_HOST=0.0.0.0
+      - MCP_PORT=8001
+    command: ["python", "-m", "ern.mcp_server"]
+    depends_on:
+      - ern-agent

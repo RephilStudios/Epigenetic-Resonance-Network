@@ -49,3 +49,20 @@ class ModulePatchRequest(BaseModel):
 class BuilderRequest(BaseModel):
     message: str
     history: List[Message] = []
+
+
+class DeepRecallRequest(BaseModel):
+    query: str
+    pipeline: Optional[List[str]] = None
+    n_hops: int = 3
+    top_k_candidates: int = 10
+    hop_ltp_boost: float = 0.5   # energy delta applied to the chosen node per hop
+
+
+class DeepRecallResponse(BaseModel):
+    recall_chain_id: str
+    original_query: str
+    final_memories: List[Dict[str, Any]]
+    hop_log: List[Dict[str, Any]]
+    boosted_nodes: List[Dict[str, Any]]   # [{module_id, memory_id, delta_e}]
+

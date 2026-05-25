@@ -200,7 +200,7 @@ class ERNModule:
         self.short_term_energies = self.short_term_energies * self.stp_decay_rate
         self._save_state()
 
-    def retrieve(self, query_text: str, top_k: int = 5, threshold: float = 0.15, decay: bool = True, tags_filter: Optional[List[str]] = None, memory_type_filter: Optional[str] = None):
+    def retrieve(self, query_text: str, top_k: int = 5, threshold: float = 0.15, decay: bool = True, tags_filter: Optional[List[str]] = None, memory_type_filter: Optional[str] = None, dry_run: bool = False):
         if self.memory_bank.size(0) == 0:
             return []
 
@@ -263,8 +263,9 @@ class ERNModule:
                 new_e = min(old_e + 0.3 + 0.1 * old_st, 5.0)
                 new_st = min(old_st + 0.5, 3.0)
 
-                self.energies[idx] = new_e
-                self.short_term_energies[idx] = new_st
+                if not dry_run:
+                    self.energies[idx] = new_e
+                    self.short_term_energies[idx] = new_st
 
                 boost_indices.append(idx)
                 boost_amounts.append(new_e - old_e)
@@ -276,13 +277,13 @@ class ERNModule:
                         "text"     : self.vault[mem_id]["text"],
                         "tags"     : self.vault[mem_id]["tags"],
                         "resonance": round(val, 3),
-                        "energy"   : round(new_e, 3),
-                        "stp_energy": round(new_st, 3),
+                        "energy"   : round(new_e if not dry_run else old_e, 3),
+                        "stp_energy": round(new_st if not dry_run else old_st, 3),
                         "image_url": self.vault[mem_id].get("image_url"),
                         "timestamp": self.vault[mem_id].get("timestamp", 0.0)
                     })
 
-        if boost_indices:
+        if boost_indices and not dry_run:
             self.deltas.push(TensorDelta(
                 op            = DeltaOp.BOOST,
                 timestamp     = self._now(),
@@ -295,6 +296,33 @@ class ERNModule:
 
         self.query_count += 1
         return results
+
+    def boost_node(self, memory_id: str, delta_e: float, recall_chain_id: str) -> bool:
+        """
+        Surgical single-node Hebbian LTP boost for use during Deep Recall hops.
+        Tagged with recall_chain_id so rollback_chain() can precisely reverse it via LTD.
+        Returns True if the node was found and boosted, False otherwise.
+        """
+        idx = self.labels.index(memory_id) if memory_id in self.labels else -1
+        if idx < 0:
+            return False
+        old_e = self.energies[idx].item()
+        new_e = min(old_e + delta_e, 5.0)
+        actual_delta = new_e - old_e
+        self.energies[idx] = new_e
+        self.deltas.push(TensorDelta(
+            op              = DeltaOp.DEEP_RECALL_BOOST,
+            timestamp       = self._now(),
+            delta_id        = str(uuid.uuid4()),
+            prev_size       = self.memory_bank.size(0),
+            next_size       = self.memory_bank.size(0),
+            boost_indices   = [idx],
+            boost_amounts   = [actual_delta],
+            memory_id       = memory_id,
+            recall_chain_id = recall_chain_id,
+        ))
+        print(f"[ERN][{self.name}] Deep Recall hop boost: node={memory_id[:8]} Δe=+{actual_delta:.3f} chain={recall_chain_id[:8]}")
+        return True
 
     def sleep_cycle(self) -> int:
         if self.frozen or self.memory_bank.size(0) == 0:

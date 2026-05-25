@@ -301,15 +301,17 @@ class ERNModule:
         """
         Surgical single-node Hebbian LTP boost for use during Deep Recall hops.
         Tagged with recall_chain_id so rollback_chain() can precisely reverse it via LTD.
+        Thread-safe: acquires _save_lock before mutating live tensors.
         Returns True if the node was found and boosted, False otherwise.
         """
-        idx = self.labels.index(memory_id) if memory_id in self.labels else -1
-        if idx < 0:
-            return False
-        old_e = self.energies[idx].item()
-        new_e = min(old_e + delta_e, 5.0)
-        actual_delta = new_e - old_e
-        self.energies[idx] = new_e
+        with self._save_lock:
+            idx = self.labels.index(memory_id) if memory_id in self.labels else -1
+            if idx < 0:
+                return False
+            old_e = self.energies[idx].item()
+            new_e = min(old_e + delta_e, 5.0)
+            actual_delta = new_e - old_e
+            self.energies[idx] = new_e
         self.deltas.push(TensorDelta(
             op              = DeltaOp.DEEP_RECALL_BOOST,
             timestamp       = self._now(),
@@ -321,6 +323,7 @@ class ERNModule:
             memory_id       = memory_id,
             recall_chain_id = recall_chain_id,
         ))
+        self._save_state()  # Fix #5: persist boost immediately
         print(f"[ERN][{self.name}] Deep Recall hop boost: node={memory_id[:8]} Δe=+{actual_delta:.3f} chain={recall_chain_id[:8]}")
         return True
 

@@ -648,7 +648,7 @@ async def deep_recall_endpoint(req: DeepRecallRequest):
         )
 
     # Run the hop loop in a thread executor to avoid blocking uvicorn's event loop
-    loop   = asyncio.get_event_loop()
+    loop   = asyncio.get_running_loop()  # Fix #6: deprecated get_event_loop()
     result = await loop.run_in_executor(
         None,
         lambda: deep_recall(
@@ -671,68 +671,102 @@ async def deep_recall_endpoint(req: DeepRecallRequest):
 
 
 @app.post("/api/recall/rollback/{chain_id}")
-def trigger_ltd_rollback(chain_id: str, module_id: str = "default-memory"):
+def trigger_ltd_rollback(chain_id: str, module_id: Optional[str] = None):
     """
     LTD Pain Signal — atomically reverses all DEEP_RECALL_BOOST deltas tagged
-    with chain_id by subtracting their stored delta_e from the energy tensors.
+    with chain_id across ALL active modules (deep recall spans multiple experts).
     Node vectors and vault entries are NEVER deleted; only the hallucinated
     energy pathway is severed.
     """
-    mod = manager.get_module(module_id)
-    if not mod:
-        return {"error": f"Module '{module_id}' not found.", "status": "failed"}
-
-    # Check chain exists before attempting rollback
     from ern.deltas import DeltaOp
-    chain_deltas = [
-        d for d in mod.deltas.stack
-        if d.op == DeltaOp.DEEP_RECALL_BOOST
-        and getattr(d, "recall_chain_id", None) == chain_id
-    ]
-    if not chain_deltas:
+
+    # Fix #2: search all active modules, not just one
+    search_modules = (
+        [manager.get_module(module_id)] if module_id and manager.get_module(module_id)
+        else list(manager.active_modules.values())
+    )
+
+    total_undone = 0
+    modules_affected = []
+    for mod in search_modules:
+        chain_deltas = [
+            d for d in mod.deltas.stack
+            if d.op == DeltaOp.DEEP_RECALL_BOOST
+            and getattr(d, "recall_chain_id", None) == chain_id
+        ]
+        if chain_deltas:
+            undone = mod.deltas.rollback_chain(mod, chain_id)
+            total_undone += undone
+            modules_affected.append(mod.config["module_id"])
+
+    if total_undone == 0:
         return {
-            "error"   : f"Chain '{chain_id}' not found in module '{module_id}' delta stack "
-                        "(already rolled back or never committed to this module).",
+            "error"   : f"Chain '{chain_id}' not found in any active module's delta stack "
+                        "(already rolled back or never committed).",
             "status"  : "not_found",
         }
 
-    undone = mod.deltas.rollback_chain(mod, chain_id)
     return {
         "status"          : "LTD rollback complete. Hallucinated neural bridge severed.",
         "chain_id"        : chain_id,
-        "deltas_reversed" : undone,
-        "engine_size"     : mod.memory_bank.size(0),   # Unchanged — no nodes deleted
-        "stack_depth"     : len(mod.deltas.stack),
+        "deltas_reversed" : total_undone,
+        "modules_affected": modules_affected,
     }
 
 
 @app.post("/api/recall/commit/{chain_id}")
-def commit_recall_chain(chain_id: str, module_id: str = "default-memory"):
+def commit_recall_chain(chain_id: str, module_id: Optional[str] = None):
     """
     Permanently commit a recall chain — re-tags DEEP_RECALL_BOOST deltas as
-    standard BOOST ops so they are no longer eligible for chain rollback.
-    Call this when the downstream code execution succeeds.
+    standard BOOST ops across ALL active modules so they are no longer eligible
+    for chain rollback. Call this when the downstream code execution succeeds.
+    """
+    from ern.deltas import DeltaOp
+
+    # Fix #3: commit across all active modules, not just one
+    search_modules = (
+        [manager.get_module(module_id)] if module_id and manager.get_module(module_id)
+        else list(manager.active_modules.values())
+    )
+
+    total_committed = 0
+    modules_affected = []
+    for mod in search_modules:
+        committed = 0
+        with mod.deltas._lock:
+            for d in mod.deltas.stack:
+                if d.op == DeltaOp.DEEP_RECALL_BOOST and getattr(d, "recall_chain_id", None) == chain_id:
+                    d.op              = DeltaOp.BOOST
+                    d.recall_chain_id = None
+                    committed        += 1
+        if committed > 0:
+            mod._save_state(debounce=False)
+            total_committed += committed
+            modules_affected.append(mod.config["module_id"])
+
+    return {
+        "status"          : "Chain committed. LTP boosts are now permanent.",
+        "chain_id"        : chain_id,
+        "committed"       : total_committed,
+        "modules_affected": modules_affected,
+    }
+
+
+@app.get("/api/memory/query")
+def semantic_query_memories(q: str, module_id: str = "default-memory", top_k: int = 5):
+    """
+    Fix #10: Proper semantic vector search via mod.retrieve() — used by the MCP
+    query_ern_memory tool. Unlike /api/memories which does substring matching,
+    this performs cosine similarity + resonance scoring in the embedding space.
     """
     mod = manager.get_module(module_id)
     if not mod:
-        return {"error": f"Module '{module_id}' not found.", "status": "failed"}
-
-    from ern.deltas import DeltaOp
-    committed = 0
-    for d in mod.deltas.stack:
-        if d.op == DeltaOp.DEEP_RECALL_BOOST and getattr(d, "recall_chain_id", None) == chain_id:
-            d.op              = DeltaOp.BOOST
-            d.recall_chain_id = None
-            committed        += 1
-
-    if committed > 0:
-        mod._save_state(debounce=False)
-
-    return {
-        "status"    : "Chain committed. LTP boosts are now permanent.",
-        "chain_id"  : chain_id,
-        "committed" : committed,
-    }
+        return {"error": f"Module '{module_id}' not found.", "memories": []}
+    results = mod.retrieve(q, top_k=top_k, decay=False)
+    for r in results:
+        r["module_id"] = module_id
+        r["module_name"] = mod.name
+    return {"memories": results, "module_id": module_id, "query": q}
 
 
 @app.get("/api/models")

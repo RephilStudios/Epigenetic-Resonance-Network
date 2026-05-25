@@ -260,7 +260,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                     "name"       : m["config"]["name"],
                     "description": m["config"].get("description", ""),
                     "frozen"     : m["config"].get("frozen", False),
-                    "memory_count": m.get("memory_count", 0),
+                    "memory_count": m.get("synapses_count", 0),  # Fix #8: correct key
                 }
                 for m in modules
             ]
@@ -275,14 +275,17 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             }, indent=2))]
 
         elif name == "query_ern_memory":
+            # Fix #10: use /api/memory/query for proper cosine-similarity semantic search
+            # (the old /api/memories endpoint only did substring text matching)
             r = await client.get(
-                f"{ERN_API_BASE}/api/memories",
+                f"{ERN_API_BASE}/api/memory/query",
                 params={
                     "q"        : arguments["query"],
                     "module_id": arguments.get("module_id", "default-memory"),
+                    "top_k"    : arguments.get("top_k", 5),
                 },
             )
-            memories = r.json().get("memories", [])[:arguments.get("top_k", 5)]
+            memories = r.json().get("memories", [])
             return [TextContent(type="text", text=json.dumps(memories, indent=2))]
 
         elif name == "deep_recall":

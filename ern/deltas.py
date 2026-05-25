@@ -1,5 +1,6 @@
 import os
 import uuid
+import threading
 import torch
 from enum import Enum
 from dataclasses import dataclass
@@ -64,53 +65,68 @@ class TensorDeltaStack:
     def __init__(self, max_len: int = 10_000):
         self.stack: List[TensorDelta] = []
         self.max_len = max_len
+        self._lock = threading.Lock()  # Fix #11: thread-safe push/rollback
 
     def push(self, delta: TensorDelta):
-        self.stack.append(delta)
-        if len(self.stack) > self.max_len:
-            trim = self.max_len // 4
-            self.stack = self.stack[trim:]
-            print(f"[DELTA STACK] Trimmed {trim} oldest deltas. Current depth: {len(self.stack)}")
+        with self._lock:
+            self.stack.append(delta)
+            if len(self.stack) > self.max_len:
+                trim = self.max_len // 4
+                self.stack = self.stack[trim:]
+                print(f"[DELTA STACK] Trimmed {trim} oldest deltas. Current depth: {len(self.stack)}")
         print(f"[DELTA STACK] +{delta.summary()}")
 
     def tail(self, n: int = 10) -> List[TensorDelta]:
-        return self.stack[-n:]
+        with self._lock:
+            return list(self.stack[-n:])
 
     def stats(self) -> Dict[str, Any]:
-        counts = {op: 0 for op in DeltaOp}
-        for d in self.stack:
-            counts[d.op] += 1
-        return {
-            "depth"  : len(self.stack),
-            "by_op"  : {k.value: v for k, v in counts.items()},
-            "oldest" : self.stack[0].timestamp  if self.stack else None,
-            "newest" : self.stack[-1].timestamp if self.stack else None,
-        }
+        with self._lock:
+            counts = {op: 0 for op in DeltaOp}
+            for d in self.stack:
+                counts[d.op] += 1
+            return {
+                "depth"  : len(self.stack),
+                "by_op"  : {k.value: v for k, v in counts.items()},
+                "oldest" : self.stack[0].timestamp  if self.stack else None,
+                "newest" : self.stack[-1].timestamp if self.stack else None,
+            }
 
     def rollback_chain(self, engine: "ERNModule", chain_id: str) -> int:
         """
         LTD Pain Signal: atomically reverses all DEEP_RECALL_BOOST deltas tagged
         with chain_id by subtracting the stored delta_e from each node's energy.
+        Uses memory_id (string label) to resolve the current tensor index, making
+        it resilient to SLEEP pruning which shifts raw integer indices.
         The node vectors and vault entries are NEVER deleted — only the hallucinated
         energy pathway is severed.  Returns the count of deltas reversed.
         """
-        import torch
         undone = 0
-        new_stack = list(self.stack)
-        for i in reversed(range(len(new_stack))):
-            d = new_stack[i]
-            if d.op == DeltaOp.DEEP_RECALL_BOOST and d.recall_chain_id == chain_id:
-                if d.boost_indices and d.boost_amounts:
-                    for idx, amt in zip(d.boost_indices, d.boost_amounts):
-                        if 0 <= idx < engine.memory_bank.size(0):
-                            # Exact inverse: subtract the stored positive delta
-                            engine.energies[idx] = torch.clamp(
-                                engine.energies[idx] - amt,
+        with self._lock:
+            new_stack = list(self.stack)
+            for i in reversed(range(len(new_stack))):
+                d = new_stack[i]
+                if d.op == DeltaOp.DEEP_RECALL_BOOST and d.recall_chain_id == chain_id:
+                    if d.boost_amounts:
+                        amt = d.boost_amounts[0] if d.boost_amounts else 0.0
+                        if d.memory_id and d.memory_id in engine.labels:
+                            # Fix #1: resolve by string label — safe after SLEEP pruning
+                            cur_idx = engine.labels.index(d.memory_id)
+                            engine.energies[cur_idx] = torch.clamp(
+                                engine.energies[cur_idx] - amt,
                                 min=0.0,
                             )
-                new_stack.pop(i)
-                undone += 1
-        self.stack = new_stack
+                        elif d.boost_indices:
+                            # Fallback: legacy deltas without memory_id use stored index
+                            for idx, a in zip(d.boost_indices, d.boost_amounts):
+                                if 0 <= idx < engine.memory_bank.size(0):
+                                    engine.energies[idx] = torch.clamp(
+                                        engine.energies[idx] - a,
+                                        min=0.0,
+                                    )
+                    new_stack.pop(i)
+                    undone += 1
+            self.stack = new_stack
         if undone > 0:
             engine._save_state(debounce=False)
         print(f"[LTD][rollback_chain] Reversed {undone} DEEP_RECALL_BOOST delta(s) for chain={chain_id[:8]}")

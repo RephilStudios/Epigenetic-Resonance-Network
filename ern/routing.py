@@ -10,10 +10,19 @@ from ern.module import manager
 def route_query_to_modules(user_message: str, available_modules: List[Dict[str, Any]]) -> List[str]:
     print("\n[SYSTEM] Commencing dynamic hybrid cognitive routing...")
     
-    # Exclude frozen modules and default-memory from routing candidates
-    routable = [m for m in available_modules if not m["config"].get("frozen", False) and m["config"]["module_id"] != "default-memory"]
+    # Exclude frozen modules, default-memory, and any unselected modules (not in default_pipeline) from routing candidates
+    active_pipeline = manager.registry.get("default_pipeline", [])
+    routable = [
+        m for m in available_modules 
+        if not m["config"].get("frozen", False) 
+        and m["config"]["module_id"] != "default-memory"
+        and m["config"]["module_id"] in active_pipeline
+    ]
     if not routable:
-        return ["default-memory"]
+        fallback_pipeline = [pid for pid in active_pipeline if pid in manager.registry["modules"]]
+        if not fallback_pipeline:
+            return ["default-memory"]
+        return fallback_pipeline
 
     modules_desc = []
     for m in routable:
@@ -95,8 +104,12 @@ def route_query_to_modules(user_message: str, available_modules: List[Dict[str, 
     print(f"[ROUTER] Dynamic Hybrid Routing Analysis: {routing_scores}")
     
     if not selected_ids:
-        print("[ROUTER] No module scored above threshold. Routing to default-memory.")
-        return ["default-memory"]
+        fallback_pipeline = [pid for pid in active_pipeline if pid in manager.registry["modules"]]
+        if not fallback_pipeline:
+            print("[ROUTER] No module scored above threshold and active pipeline is empty. Routing to default-memory.")
+            return ["default-memory"]
+        print(f"[ROUTER] No module scored above threshold. Falling back to active pipeline: {fallback_pipeline}")
+        return fallback_pipeline
         
     print(f"[ROUTER] Dynamically routed to: {selected_ids}")
     return selected_ids

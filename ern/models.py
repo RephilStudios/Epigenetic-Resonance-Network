@@ -16,6 +16,8 @@ class ChatRequest(BaseModel):
     pipeline: Optional[List[str]] = None
     auto_route: bool = False
     active_expert: Optional[str] = None
+    tags_filter: Optional[List[str]] = None
+    memory_type_filter: Optional[str] = None
 
 class ChatResponse(BaseModel):
     reply: str

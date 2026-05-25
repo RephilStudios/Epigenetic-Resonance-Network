@@ -6,12 +6,21 @@ import torch
 import torch.nn.functional as F
 from sentence_transformers import SentenceTransformer
 from typing import List, Optional, Dict, Any
+import threading
+import copy
+from concurrent.futures import ThreadPoolExecutor
 
 from ern.config import SAVE_DIR, _resolve_device
 from ern.deltas import DeltaOp, TensorDelta, TensorDeltaStack
 
 class ERNModule:
+    # Shared single-thread executor to run background serialization operations sequentially
+    _executor = ThreadPoolExecutor(max_workers=1)
+
     def __init__(self, config: Dict[str, Any], model_name='all-MiniLM-L6-v2', device: str = 'auto', embedder: Optional[SentenceTransformer] = None):
+        self._save_timer = None
+        self._save_lock = threading.Lock()
+
         self.module_id = config["module_id"]
         self.name = config["name"]
         self.description = config.get("description", "")
@@ -70,6 +79,68 @@ class ERNModule:
         return None
 
     def encode_hebbian(self, text: str, tags: str, image_url: Optional[str] = None, memory_type: str = "fact") -> str:
+        combined = f"{tags} {text}"
+        vec = self._encode(combined)
+
+        # ── Duplicate Detection & Incremental Fusion ──────────────────────────
+        if self.memory_bank.size(0) > 0:
+            similarities = F.cosine_similarity(vec, self.memory_bank)
+            max_sim, max_idx = torch.max(similarities, dim=0)
+            print(f"[ERN][{self.name}] Duplicate check: max_sim={max_sim.item():.4f} against index {max_idx.item()}")
+            if max_sim.item() > 0.75:
+                existing_mem_id = self.labels[max_idx.item()]
+                print(f"[ERN][{self.name}] Duplicate detected (sim={max_sim.item():.3f}). Fusing with existing synapse {existing_mem_id}.")
+
+                # 1. Hebbian reinforcement: Boost its energies
+                old_e = self.energies[max_idx].item()
+                old_st = self.short_term_energies[max_idx].item()
+                new_e = min(old_e + 0.6 + 0.2 * old_st, 5.0)
+                new_st = min(old_st + 1.0, 3.0)
+
+                self.energies[max_idx] = new_e
+                self.short_term_energies[max_idx] = new_st
+
+                # 2. Incremental Fusion: Merge tags and metadata
+                existing_entry = self.vault[existing_mem_id]
+                old_tags = [t.strip() for t in existing_entry.get("tags", "").split(",") if t.strip()]
+                new_tags = [t.strip() for t in tags.split(",") if t.strip()]
+                
+                merged_tags = []
+                seen_tags = set()
+                for t in old_tags + new_tags:
+                    t_lower = t.lower()
+                    if t_lower not in seen_tags:
+                        seen_tags.add(t_lower)
+                        merged_tags.append(t)
+
+                existing_entry["tags"] = ", ".join(merged_tags)
+                existing_entry["timestamp"] = self._now()
+                if image_url and not existing_entry.get("image_url"):
+                    existing_entry["image_url"] = image_url
+
+                # Overwrite text/vector if the new statement is longer/more detailed
+                if len(text) >= len(existing_entry.get("text", "")):
+                    existing_entry["text"] = text
+                    self.memory_bank[max_idx] = vec.squeeze(0)
+                    if memory_type in ("instruction", "question") or existing_entry.get("memory_type") == "fact":
+                        existing_entry["memory_type"] = memory_type
+
+                # 3. Deltas transaction logging
+                self.deltas.push(TensorDelta(
+                    op            = DeltaOp.BOOST,
+                    timestamp     = self._now(),
+                    delta_id      = str(uuid.uuid4()),
+                    prev_size     = self.memory_bank.size(0),
+                    next_size     = self.memory_bank.size(0),
+                    boost_indices = [max_idx.item()],
+                    boost_amounts = [new_e - old_e],
+                    memory_id     = existing_mem_id,
+                ))
+
+                self._save_state()
+                return existing_mem_id
+
+        # ── Form New Synapse ──────────────────────────────────────────────────
         memory_id = str(uuid.uuid4())
         self.vault[memory_id] = {
             "text": text,
@@ -79,9 +150,6 @@ class ERNModule:
         }
         if image_url:
             self.vault[memory_id]["image_url"] = image_url
-
-        combined = f"{tags} {text}"
-        vec = self._encode(combined)
 
         prev_size = self.memory_bank.size(0)
         self.memory_bank = torch.cat([self.memory_bank, vec], dim=0)
@@ -132,13 +200,40 @@ class ERNModule:
         self.short_term_energies = self.short_term_energies * self.stp_decay_rate
         self._save_state()
 
-    def retrieve(self, query_text: str, top_k: int = 5, threshold: float = 0.15, decay: bool = True):
+    def retrieve(self, query_text: str, top_k: int = 5, threshold: float = 0.15, decay: bool = True, tags_filter: Optional[List[str]] = None, memory_type_filter: Optional[str] = None):
         if self.memory_bank.size(0) == 0:
             return []
 
         q_vec       = self._encode(query_text)
         similarities = F.cosine_similarity(q_vec, self.memory_bank)
         resonance    = similarities * (1.0 + torch.log1p(self.energies + self.short_term_energies))
+
+        # Apply structured constraints via PyTorch masking
+        if (tags_filter and len(tags_filter) > 0) or memory_type_filter:
+            mask = torch.ones((self.memory_bank.size(0),), dtype=torch.bool, device=self.device)
+            for idx, mem_id in enumerate(self.labels):
+                entry = self.vault.get(mem_id)
+                if not entry:
+                    mask[idx] = False
+                    continue
+
+                if memory_type_filter:
+                    if entry.get("memory_type") != memory_type_filter:
+                        mask[idx] = False
+                        continue
+
+                if tags_filter and len(tags_filter) > 0:
+                    entry_tags = [t.strip().lower() for t in entry.get("tags", "").split(",") if t.strip()]
+                    match = True
+                    for filter_tag in tags_filter:
+                        if filter_tag.lower() not in entry_tags:
+                            match = False
+                            break
+                    if not match:
+                        mask[idx] = False
+                        continue
+
+            resonance = resonance * mask.float()
 
         prev_size = self.memory_bank.size(0)
         if decay and not self.frozen:
@@ -271,30 +366,79 @@ class ERNModule:
             ])
             self.labels.pop(idx)
             self.vault.pop(memory_id, None)
-            self._save_state()
+            self._save_state(debounce=False)
             print(f"[ERN][{self.name}] Synapse {memory_id} forgotten. Network size: {self.memory_bank.size(0)} nodes.")
             return True
         return False
 
-    def _save_state(self):
-        os.makedirs(self.module_dir, exist_ok=True)
+    def _save_state(self, debounce: bool = True):
+        if not debounce:
+            self.flush_save()
+            return
+
+        with self._save_lock:
+            # Debounce: Cancel any existing pending save timer
+            if self._save_timer is not None:
+                self._save_timer.cancel()
+
+            # Schedule a new background save in 2 seconds
+            self._save_timer = threading.Timer(2.0, self._execute_async_save)
+            self._save_timer.daemon = True
+            self._save_timer.start()
+
+    def _execute_async_save(self):
+        # 1. Take fast, sub-millisecond thread-safe copies of data states on the main thread
+        with self._save_lock:
+            state_snapshot = {
+                'memory_bank': self.memory_bank.cpu().clone(),
+                'energies': self.energies.cpu().clone(),
+                'short_term_energies': self.short_term_energies.cpu().clone(),
+                'labels': list(self.labels),
+                'vault': copy.deepcopy(self.vault)
+            }
+            deltas_snapshot = list(self.deltas.stack)
+            self._save_timer = None
+
+        # 2. Dispatch to the single-thread background executor to execute serialization
+        self._executor.submit(self._write_snapshot_to_disk, state_snapshot, deltas_snapshot)
+
+    def _write_snapshot_to_disk(self, state_snapshot, deltas_snapshot):
         try:
-            os.chmod(self.module_dir, 0o777)
-        except Exception:
-            pass
-        torch.save({
-            'memory_bank': self.memory_bank,
-            'energies'   : self.energies,
-            'short_term_energies': self.short_term_energies,
-            'labels'     : self.labels,
-            'vault'      : self.vault,
-        }, self.state_path)
-        self.deltas.save(self.delta_path)
-        try:
-            os.chmod(self.state_path, 0o666)
-            os.chmod(self.delta_path, 0o666)
-        except Exception:
-            pass
+            os.makedirs(self.module_dir, exist_ok=True)
+            try:
+                os.chmod(self.module_dir, 0o777)
+            except Exception:
+                pass
+
+            torch.save(state_snapshot, self.state_path)
+            torch.save(deltas_snapshot, self.delta_path)
+
+            try:
+                os.chmod(self.state_path, 0o666)
+                os.chmod(self.delta_path, 0o666)
+            except Exception:
+                pass
+            print(f"[ASYNC PERSISTENCE][{self.name}] ✓ Consolidated state successfully written to disk in background thread.")
+        except Exception as e:
+            print(f"[ASYNC PERSISTENCE][{self.name}] ERROR: Failed to write state to disk in background thread: {e}")
+
+    def flush_save(self):
+        """Immediately writes the current live tensor states to disk, canceling any pending timers."""
+        with self._save_lock:
+            if self._save_timer is not None:
+                self._save_timer.cancel()
+                self._save_timer = None
+            
+            state_snapshot = {
+                'memory_bank': self.memory_bank.cpu().clone(),
+                'energies': self.energies.cpu().clone(),
+                'short_term_energies': self.short_term_energies.cpu().clone(),
+                'labels': list(self.labels),
+                'vault': copy.deepcopy(self.vault)
+            }
+            deltas_snapshot = list(self.deltas.stack)
+
+        self._write_snapshot_to_disk(state_snapshot, deltas_snapshot)
 
     def _load_state(self):
         self.deltas.load(self.delta_path)

@@ -61,21 +61,23 @@ def process_chat(req: ChatRequest, background_tasks: BackgroundTasks):
     
     # 1. Resolve pipeline modules
     modules_list = manager.list_modules()
+    active_pipeline = manager.registry.get("default_pipeline", ["default-memory"])
+    
     if req.auto_route:
         pipeline_ids = route_query_to_modules(user_message, modules_list)
-        # Always include default-memory as a fallback for context + memory saving
-        if "default-memory" not in pipeline_ids:
+        # Only include default-memory as a fallback for retrieval if it is actually selected in the default pipeline
+        if "default-memory" in active_pipeline and "default-memory" not in pipeline_ids:
             pipeline_ids.append("default-memory")
     elif req.pipeline:
         pipeline_ids = [pid for pid in req.pipeline if pid in manager.registry["modules"]]
+    else:
+        pipeline_ids = [pid for pid in active_pipeline if pid in manager.registry["modules"]]
+    
+    # Safety: never operate with a completely empty pipeline. If empty, fall back to selected active pipeline modules.
+    if not pipeline_ids:
+        pipeline_ids = [pid for pid in active_pipeline if pid in manager.registry["modules"]]
         if not pipeline_ids:
             pipeline_ids = ["default-memory"]
-    else:
-        pipeline_ids = manager.registry.get("default_pipeline", ["default-memory"])
-    
-    # Safety: never operate with an empty pipeline
-    if not pipeline_ids:
-        pipeline_ids = ["default-memory"]
 
     print(f"[SYSTEM] Processing chat turn via active MOE pipeline: {pipeline_ids}")
 
@@ -109,7 +111,10 @@ def process_chat(req: ChatRequest, background_tasks: BackgroundTasks):
             
         mod_results_count = 0
         for q in search_queries:
-            q_mems = mod.retrieve(q, top_k=3, threshold=req.focus_threshold, decay=False)
+            q_mems = mod.retrieve(
+                q, top_k=3, threshold=req.focus_threshold, decay=False,
+                tags_filter=req.tags_filter, memory_type_filter=req.memory_type_filter
+            )
             for m in q_mems:
                 unique_key = f"{pid}:{m['memory_id']}"
                 if unique_key not in seen_ids:
@@ -481,7 +486,7 @@ def update_pipeline_endpoint(pipeline: List[str]):
 
 
 @app.get("/api/memories")
-def get_all_memories(q: Optional[str] = None, module_id: str = "default-memory"):
+def get_all_memories(q: Optional[str] = None, module_id: str = "default-memory", tags_filter: Optional[str] = None, memory_type_filter: Optional[str] = None):
     # When auto-route is selected, only aggregate modules in the active pipeline
     if module_id == "auto-route":
         module_ids = manager.registry.get("default_pipeline", ["default-memory"])
@@ -491,6 +496,8 @@ def get_all_memories(q: Optional[str] = None, module_id: str = "default-memory")
         module_ids = [module_id]
 
     results = []
+    parsed_tags = [t.strip().lower() for t in tags_filter.split(",") if t.strip()] if tags_filter else []
+
     for mid in module_ids:
         mod = manager.get_module(mid)
         if not mod:
@@ -507,6 +514,19 @@ def get_all_memories(q: Optional[str] = None, module_id: str = "default-memory")
             if q:
                 q_lower = q.lower()
                 if q_lower not in data["text"].lower() and q_lower not in data["tags"].lower():
+                    continue
+
+            if memory_type_filter and mtype != memory_type_filter:
+                continue
+
+            if parsed_tags:
+                entry_tags = [t.strip().lower() for t in data["tags"].split(",") if t.strip()]
+                match = True
+                for t in parsed_tags:
+                    if t not in entry_tags:
+                        match = False
+                        break
+                if not match:
                     continue
 
             results.append({
@@ -608,6 +628,23 @@ def get_models():
 def serve_ui():
     return HTMLResponse(content=HTML_TEMPLATE, status_code=200)
 
+
+@app.on_event("shutdown")
+def shutdown_event():
+    print("[SYSTEM] FastAPI shutting down — flushing all active module debounced memory writes...")
+    for mod in manager.active_modules.values():
+        mod.flush_save()
+    print("[SYSTEM] Memory flush complete.")
+
+import atexit
+@atexit.register
+def exit_handler():
+    # Fallback sync flush to completely guarantee no memory leaks on system exit
+    for mod in manager.active_modules.values():
+        try:
+            mod.flush_save()
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)

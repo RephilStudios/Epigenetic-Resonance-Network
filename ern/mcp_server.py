@@ -414,7 +414,7 @@ async def get_prompt(name: str, arguments: dict[str, Any] | None) -> GetPromptRe
             description = "ERN Autonomous Memory Agent — master operating directive",
             messages    = [
                 PromptMessage(
-                    role    = "user",
+                    role    = "system",  # Fix acp_thread: system role prevents consecutive user message API errors
                     content = TextContent(type="text", text=_AUTONOMOUS_AGENT_PROMPT),
                 )
             ],
@@ -438,7 +438,7 @@ async def get_prompt(name: str, arguments: dict[str, Any] | None) -> GetPromptRe
         description = desc,
         messages    = [
             PromptMessage(
-                role    = "user",
+                role    = "system",  # Fix acp_thread: system role keeps message history alternating correctly
                 content = TextContent(type="text", text=directive),
             )
         ],

@@ -25,6 +25,7 @@ from ern.models import (
     Message, ChatRequest, ChatResponse, MemoryStoreRequest,
     ModuleConfig, ModulePatchRequest, BuilderRequest,
     DeepRecallRequest, DeepRecallResponse,
+    CustomPrompt, CustomPromptPatchRequest,
 )
 from ern.module import manager
 from ern.helpers import (
@@ -491,6 +492,54 @@ def update_pipeline_endpoint(pipeline: List[str]):
     manager.registry["default_pipeline"] = clean_pipeline
     manager._save_registry(manager.registry)
     return {"status": "Success", "default_pipeline": clean_pipeline}
+
+
+# ── Custom Prompt Registry ────────────────────────────────────────────────────
+
+def _slugify(name: str) -> str:
+    """Convert a human name into a valid slash-command slug."""
+    import re
+    return re.sub(r'[^a-z0-9_]+', '_', name.lower().strip()).strip('_')
+
+@app.get("/api/prompts")
+def list_prompts_endpoint():
+    prompts = manager.registry.get("custom_prompts", {})
+    return {"prompts": list(prompts.values())}
+
+@app.post("/api/prompts")
+def create_prompt_endpoint(req: CustomPrompt):
+    prompts = manager.registry.setdefault("custom_prompts", {})
+    slug = _slugify(req.name)
+    if slug in prompts:
+        return {"error": f"Prompt '{slug}' already exists.", "status": "Failed"}
+    entry = {"name": slug, "description": req.description, "text": req.text}
+    prompts[slug] = entry
+    manager.registry["custom_prompts"] = prompts
+    manager._save_registry(manager.registry)
+    return {"status": "Created", "prompt": entry}
+
+@app.patch("/api/prompts/{name}")
+def patch_prompt_endpoint(name: str, req: CustomPromptPatchRequest):
+    prompts = manager.registry.get("custom_prompts", {})
+    if name not in prompts:
+        return {"error": f"Prompt '{name}' not found.", "status": "Failed"}
+    if req.description is not None:
+        prompts[name]["description"] = req.description
+    if req.text is not None:
+        prompts[name]["text"] = req.text
+    manager.registry["custom_prompts"] = prompts
+    manager._save_registry(manager.registry)
+    return {"status": "Updated", "prompt": prompts[name]}
+
+@app.delete("/api/prompts/{name}")
+def delete_prompt_endpoint(name: str):
+    prompts = manager.registry.get("custom_prompts", {})
+    if name not in prompts:
+        return {"error": f"Prompt '{name}' not found.", "status": "Failed"}
+    deleted = prompts.pop(name)
+    manager.registry["custom_prompts"] = prompts
+    manager._save_registry(manager.registry)
+    return {"status": "Deleted", "prompt": deleted}
 
 
 @app.get("/api/memories")

@@ -417,6 +417,41 @@ select option { background: var(--bg); }
   border: 1px solid rgba(255,58,58,0.45);
   color: var(--red);
 }
+.prompt-card {
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  transition: border-color 0.2s;
+}
+.prompt-card:hover { border-color: var(--g3); }
+.prompt-card-name {
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  font-weight: bold;
+  color: var(--g0);
+  letter-spacing: 0.04em;
+}
+.prompt-card-desc {
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  color: var(--text-dim);
+}
+.prompt-card-body {
+  font-family: var(--font-mono);
+  font-size: 0.65rem;
+  color: var(--g2);
+  border-top: 1px solid var(--border);
+  padding-top: 6px;
+  margin-top: 2px;
+  white-space: pre-wrap;
+  max-height: 80px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 .moe-card-desc {
   font-size: 0.75rem;
   color: var(--g2);
@@ -764,6 +799,7 @@ input:checked + .slider:before {
   <div class="main-tabs" style="display:flex; height:100%; margin-left:24px; border-left: 1px solid var(--border); padding-left: 8px;">
     <div id="main-tab-chat" class="main-tab active" onclick="switchMainView('chat')">💬 CHAT CONSOLE</div>
     <div id="main-tab-moe" class="main-tab" onclick="switchMainView('moe')">🧠 MOE ARCHITECT</div>
+    <div id="main-tab-prompts" class="main-tab" onclick="switchMainView('prompts')">⚡ PROMPTS</div>
   </div>
   <div id="status-ticker"><span id="ticker-inner">SYSTEM ONLINE — PYTORCH ENGINE ACTIVE — AWAITING QUERIES — EPIGENETIC RESONANCE NETWORK INITIALIZED —&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;SYSTEM ONLINE — PYTORCH ENGINE ACTIVE — AWAITING QUERIES — EPIGENETIC RESONANCE NETWORK INITIALIZED —&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;</span></div>
   <div class="hud-pill live">VRAM LIVE</div>
@@ -879,6 +915,51 @@ Awaiting input...</div>
     </div>
   </div>
 </div>
+
+<!-- PROMPTS MANAGER PANEL -->
+<div id="prompts-dashboard" style="display:none; flex-direction:column; flex:1; padding:18px 24px; gap:18px; overflow-y:auto;">
+  <div class="moe-dash-header">
+    <div class="moe-dash-title">⚡ MCP PROMPT REGISTRY</div>
+    <div style="font-family:var(--font-mono); font-size:0.7rem; color:var(--text-dim);">ZED SLASH COMMAND MANAGER</div>
+  </div>
+  <div style="display:grid; grid-template-columns:1fr 1fr; gap:18px; flex:1;">
+    <!-- Left: Prompt list -->
+    <div style="display:flex; flex-direction:column; gap:10px;">
+      <div style="display:flex; justify-content:space-between; align-items:center;">
+        <div style="font-family:var(--font-hud); font-size:0.85rem; font-weight:bold; color:var(--text);">DEPLOYED PROMPTS</div>
+        <button onclick="loadPromptsUI()" style="background:transparent; border:1px solid var(--border); color:var(--g0); font-family:var(--font-mono); font-size:0.7rem; padding:4px 8px; border-radius:4px; cursor:pointer;">🔄 REFRESH</button>
+      </div>
+      <div id="promptsList" style="display:flex; flex-direction:column; gap:8px;">
+        <div class="no-mem">Loading prompts...</div>
+      </div>
+    </div>
+    <!-- Right: Create / Edit form -->
+    <div style="display:flex; flex-direction:column; gap:10px;">
+      <div style="font-family:var(--font-hud); font-size:0.85rem; font-weight:bold; color:var(--g0); letter-spacing:0.05em;">✏️ CREATE / EDIT PROMPT</div>
+      <div style="background:var(--bg2); border:1px solid var(--border); border-radius:6px; padding:14px; display:flex; flex-direction:column; gap:10px;">
+        <input type="hidden" id="promptEditingName" value="">
+        <div>
+          <label style="font-family:var(--font-mono); font-size:0.65rem; color:var(--text-dim); display:block; margin-bottom:4px; letter-spacing:0.06em;">NAME (becomes /slash-command)</label>
+          <input type="text" id="promptName" placeholder="my_coding_rules" oninput="updateSlugPreview()" style="width:100%; box-sizing:border-box; background:var(--bg3); border:1px solid var(--border); color:var(--text); font-family:var(--font-mono); font-size:0.8rem; padding:8px 10px; border-radius:4px; outline:none;">
+          <div id="promptSlugPreview" style="font-family:var(--font-mono); font-size:0.6rem; color:var(--g2); margin-top:4px;">Zed command: <span style="color:var(--g0);">/autonomous_memory_agent</span></div>
+        </div>
+        <div>
+          <label style="font-family:var(--font-mono); font-size:0.65rem; color:var(--text-dim); display:block; margin-bottom:4px; letter-spacing:0.06em;">DESCRIPTION (shown as tooltip in Zed)</label>
+          <input type="text" id="promptDescription" placeholder="Injects coding rules and style preferences..." style="width:100%; box-sizing:border-box; background:var(--bg3); border:1px solid var(--border); color:var(--text); font-family:var(--font-mono); font-size:0.8rem; padding:8px 10px; border-radius:4px; outline:none;">
+        </div>
+        <div>
+          <label style="font-family:var(--font-mono); font-size:0.65rem; color:var(--text-dim); display:block; margin-bottom:4px; letter-spacing:0.06em;">BODY (injected as system message)</label>
+          <textarea id="promptBody" rows="10" placeholder="You are a coding assistant with strict rules...\nAlways use async/await..." style="width:100%; box-sizing:border-box; background:var(--bg3); border:1px solid var(--border); color:var(--text); font-family:var(--font-mono); font-size:0.75rem; padding:8px 10px; border-radius:4px; outline:none; resize:vertical; line-height:1.5;"></textarea>
+        </div>
+        <div style="display:flex; gap:8px;">
+          <button id="promptSaveBtn" onclick="savePrompt()" style="flex:1; background:rgba(0,255,136,0.1); border:1px solid var(--g2); color:var(--g0); font-family:var(--font-hud); font-size:0.75rem; padding:10px; border-radius:4px; cursor:pointer; letter-spacing:0.08em; transition: all 0.2s;">⚡ DEPLOY PROMPT</button>
+          <button onclick="clearPromptForm()" style="background:transparent; border:1px solid var(--border); color:var(--text-dim); font-family:var(--font-hud); font-size:0.75rem; padding:10px 14px; border-radius:4px; cursor:pointer;">CLR</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
 
 <div id="sidebar">
   <div style="padding: 10px 10px 0 10px;">
@@ -1325,24 +1406,180 @@ function switchTab(tab) {
 
 function switchMainView(view) {
   activeMainView = view;
-  const chatArea = document.getElementById('chat-area');
-  const moeDash = document.getElementById('moe-dashboard');
-  const chatTab = document.getElementById('main-tab-chat');
-  const moeTab = document.getElementById('main-tab-moe');
-  
+  const chatArea      = document.getElementById('chat-area');
+  const moeDash       = document.getElementById('moe-dashboard');
+  const promptsDash   = document.getElementById('prompts-dashboard');
+  const chatTab       = document.getElementById('main-tab-chat');
+  const moeTab        = document.getElementById('main-tab-moe');
+  const promptsTab    = document.getElementById('main-tab-prompts');
+
+  // Hide all panels
+  chatArea.style.display    = 'none';
+  moeDash.style.display     = 'none';
+  promptsDash.style.display = 'none';
+  chatTab.classList.remove('active');
+  moeTab.classList.remove('active');
+  promptsTab.classList.remove('active');
+
   if (view === 'moe') {
-    chatArea.style.display = 'none';
     moeDash.style.display = 'flex';
-    chatTab.classList.remove('active');
     moeTab.classList.add('active');
     loadModulesUI();
+  } else if (view === 'prompts') {
+    promptsDash.style.display = 'flex';
+    promptsTab.classList.add('active');
+    loadPromptsUI();
   } else {
     chatArea.style.display = 'flex';
-    moeDash.style.display = 'none';
     chatTab.classList.add('active');
-    moeTab.classList.remove('active');
   }
 }
+
+// ── Prompt Manager ───────────────────────────────────────────────────────────
+
+function _slugifyPromptName(name) {
+  return name.toLowerCase().trim().replace(/[^a-z0-9_]+/g, '_').replace(/^_+|_+$/g, '');
+}
+
+function updateSlugPreview() {
+  const name = document.getElementById('promptName').value;
+  const slug = _slugifyPromptName(name) || 'my_prompt';
+  const editing = document.getElementById('promptEditingName').value;
+  const label = editing ? 'Editing' : 'Zed command';
+  document.getElementById('promptSlugPreview').innerHTML =
+    `${label}: <span style="color:var(--g0);">/${slug}</span>`;
+}
+
+async function loadPromptsUI() {
+  try {
+    const res = await fetch('/api/prompts');
+    if (!res.ok) throw new Error('API Error');
+    const data = await res.json();
+    renderPromptsList(data.prompts || []);
+  } catch(e) {
+    document.getElementById('promptsList').innerHTML =
+      `<div class="no-mem" style="color:var(--red);">Offline: ${e.message}</div>`;
+  }
+}
+
+function renderPromptsList(prompts) {
+  const container = document.getElementById('promptsList');
+  container.innerHTML = '';
+
+  // Always show the hardcoded autonomous_memory_agent as a read-only locked card
+  const lockedCard = document.createElement('div');
+  lockedCard.className = 'prompt-card';
+  lockedCard.style.borderColor = 'rgba(0,255,136,0.3)';
+  lockedCard.innerHTML = `
+    <div style="display:flex; justify-content:space-between; align-items:center;">
+      <div class="prompt-card-name">⚡ /autonomous_memory_agent</div>
+      <span class="moe-badge frozen" style="font-size:0.55rem;">CORE</span>
+    </div>
+    <div class="prompt-card-desc">Activate ERN Autonomous Mode — the master memory directive.</div>
+    <div class="prompt-card-body" style="color:var(--g3);">[Hardcoded — edit in mcp_server.py]</div>
+  `;
+  container.appendChild(lockedCard);
+
+  if (!prompts.length) {
+    const empty = document.createElement('div');
+    empty.className = 'no-mem';
+    empty.textContent = 'No custom prompts deployed yet. Create one →';
+    container.appendChild(empty);
+    return;
+  }
+
+  prompts.forEach(p => {
+    const card = document.createElement('div');
+    card.className = 'prompt-card';
+    card.innerHTML = `
+      <div style="display:flex; justify-content:space-between; align-items:center;">
+        <div class="prompt-card-name">/ ${p.name}</div>
+        <div style="display:flex; gap:6px;">
+          <button onclick="editPrompt(${JSON.stringify(p)})"
+            style="background:transparent; border:1px solid var(--g3); color:var(--g1); font-family:var(--font-mono); font-size:0.6rem; padding:2px 7px; border-radius:3px; cursor:pointer;">EDIT</button>
+          <button onclick="deletePrompt('${p.name}')"
+            style="background:transparent; border:1px solid var(--red); color:var(--text-dim); font-family:var(--font-mono); font-size:0.6rem; padding:2px 7px; border-radius:3px; cursor:pointer;"
+            onmouseover="this.style.color='var(--red)'" onmouseout="this.style.color='var(--text-dim)'">DEL</button>
+        </div>
+      </div>
+      <div class="prompt-card-desc">${p.description || '(no description)'}</div>
+      <div class="prompt-card-body">${p.text ? p.text.slice(0, 200) + (p.text.length > 200 ? '...' : '') : ''}</div>
+    `;
+    container.appendChild(card);
+  });
+}
+
+function editPrompt(p) {
+  document.getElementById('promptEditingName').value = p.name;
+  document.getElementById('promptName').value = p.name;
+  document.getElementById('promptName').disabled = true;  // Name is the key — can't change it
+  document.getElementById('promptDescription').value = p.description || '';
+  document.getElementById('promptBody').value = p.text || '';
+  document.getElementById('promptSaveBtn').textContent = '✏️ SAVE CHANGES';
+  updateSlugPreview();
+}
+
+function clearPromptForm() {
+  document.getElementById('promptEditingName').value = '';
+  document.getElementById('promptName').value = '';
+  document.getElementById('promptName').disabled = false;
+  document.getElementById('promptDescription').value = '';
+  document.getElementById('promptBody').value = '';
+  document.getElementById('promptSaveBtn').textContent = '⚡ DEPLOY PROMPT';
+  document.getElementById('promptSlugPreview').innerHTML =
+    'Zed command: <span style="color:var(--g0);">/my_prompt</span>';
+}
+
+async function savePrompt() {
+  const editingName = document.getElementById('promptEditingName').value;
+  const name        = _slugifyPromptName(document.getElementById('promptName').value);
+  const description = document.getElementById('promptDescription').value.trim();
+  const text        = document.getElementById('promptBody').value.trim();
+
+  if (!name) { pushToast('Name is required!', true); return; }
+  if (!text)  { pushToast('Body cannot be empty!', true); return; }
+
+  try {
+    let res;
+    if (editingName) {
+      // PATCH existing
+      res = await fetch(`/api/prompts/${editingName}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ description, text })
+      });
+    } else {
+      // POST new
+      res = await fetch('/api/prompts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, description, text })
+      });
+    }
+    if (!res.ok) throw new Error('Network error');
+    const data = await res.json();
+    if (data.error) throw new Error(data.error);
+
+    pushToast(editingName ? `Prompt '/${editingName}' updated!` : `Prompt '/${name}' deployed to Zed!`);
+    clearPromptForm();
+    loadPromptsUI();
+  } catch(e) {
+    pushToast(`Failed: ${e.message}`, true);
+  }
+}
+
+async function deletePrompt(name) {
+  if (!confirm(`Delete custom prompt '/${name}'? It will immediately disappear from Zed's / menu.`)) return;
+  try {
+    const res = await fetch(`/api/prompts/${name}`, { method: 'DELETE' });
+    if (!res.ok) throw new Error('Delete rejected');
+    pushToast(`Prompt '/${name}' removed from Zed!`);
+    loadPromptsUI();
+  } catch(e) {
+    pushToast(`Error: ${e.message}`, true);
+  }
+}
+
 
 function pushToast(msg, isError = false) {
   const t = document.createElement('div');

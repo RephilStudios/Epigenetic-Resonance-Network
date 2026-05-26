@@ -68,3 +68,12 @@ class DeepRecallResponse(BaseModel):
     hop_log: List[Dict[str, Any]]
     boosted_nodes: List[Dict[str, Any]]   # [{module_id, memory_id, delta_e}]
 
+
+class CustomPrompt(BaseModel):
+    name: str                  # slug used as the slash command, e.g. "my_prompt"
+    description: str = ""      # tooltip shown in Zed's / dropdown
+    text: str                  # full body of the prompt injected as a system message
+
+class CustomPromptPatchRequest(BaseModel):
+    description: Optional[str] = None
+    text: Optional[str]        = None

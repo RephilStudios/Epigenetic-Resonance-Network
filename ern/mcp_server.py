@@ -380,12 +380,8 @@ Immediately call `store_memory` (routing to the correct module via topology) whe
 
 @server.list_prompts()
 async def list_prompts() -> list[Prompt]:
-    """Expose the autonomous agent directive + each frozen module's system_directive as MCP Prompts."""
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        r = await client.get(f"{ERN_API_BASE}/api/modules")
-        r.raise_for_status()
-        modules = r.json().get("modules", [])
-
+    """Expose the autonomous agent directive + any user-defined custom prompts from the registry."""
+    # Always include the master autonomous memory directive
     prompts = [
         Prompt(
             name        = "autonomous_memory_agent",
@@ -395,14 +391,18 @@ async def list_prompts() -> list[Prompt]:
             ),
         ),
     ]
-    prompts += [
-        Prompt(
-            name        = f"constitution_{m['config']['module_id']}",
-            description = f"Frozen constitution: {m['config']['name']} — {m['config'].get('description', '')}",
-        )
-        for m in modules
-        if m["config"].get("frozen", False) and m["config"].get("mcp_enabled", True)
-    ]
+    # Append user-defined prompts from the registry (no frozen module constitutions)
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get(f"{ERN_API_BASE}/api/prompts")
+            if r.status_code == 200:
+                for p in r.json().get("prompts", []):
+                    prompts.append(Prompt(
+                        name        = p["name"],
+                        description = p.get("description", ""),
+                    ))
+    except Exception:
+        pass  # Don't crash the prompt list if the API is temporarily unreachable
     return prompts
 
 
@@ -414,32 +414,32 @@ async def get_prompt(name: str, arguments: dict[str, Any] | None) -> GetPromptRe
             description = "ERN Autonomous Memory Agent — master operating directive",
             messages    = [
                 PromptMessage(
-                    role    = "system",  # Fix acp_thread: system role prevents consecutive user message API errors
+                    role    = "system",
                     content = TextContent(type="text", text=_AUTONOMOUS_AGENT_PROMPT),
                 )
             ],
         )
 
-    module_id = name.removeprefix("constitution_")
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        r = await client.get(f"{ERN_API_BASE}/api/modules")
+    # Look up user-defined custom prompts from the registry
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.get(f"{ERN_API_BASE}/api/prompts")
         r.raise_for_status()
-        modules = {m["config"]["module_id"]: m for m in r.json().get("modules", [])}
+        all_prompts = {p["name"]: p for p in r.json().get("prompts", [])}
 
-    mod = modules.get(module_id)
-    if not mod or not mod["config"].get("mcp_enabled", True):
-        directive = f"[Constitution '{module_id}' not found or not exposed to MCP]"
-        desc      = "Unknown constitution"
+    p = all_prompts.get(name)
+    if not p:
+        text = f"[Prompt '{name}' not found in ERN registry]"
+        desc = "Unknown prompt"
     else:
-        directive = mod["config"].get("system_directive", "(no directive set)")
-        desc      = f"Constitution for {mod['config']['name']}"
+        text = p.get("text", "(empty prompt body)")
+        desc = p.get("description", f"Custom prompt: {name}")
 
     return GetPromptResult(
         description = desc,
         messages    = [
             PromptMessage(
-                role    = "system",  # Fix acp_thread: system role keeps message history alternating correctly
-                content = TextContent(type="text", text=directive),
+                role    = "system",
+                content = TextContent(type="text", text=text),
             )
         ],
     )

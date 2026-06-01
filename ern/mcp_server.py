@@ -45,6 +45,8 @@ from mcp.types import (
 from starlette.applications import Starlette
 from starlette.responses import Response
 from starlette.routing import Route, Mount
+# No monkey-patching needed as we use standard "user" role compliant with the MCP spec.
+
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -414,7 +416,7 @@ async def get_prompt(name: str, arguments: dict[str, Any] | None) -> GetPromptRe
             description = "ERN Autonomous Memory Agent — master operating directive",
             messages    = [
                 PromptMessage(
-                    role    = "system",
+                    role    = "user",
                     content = TextContent(type="text", text=_AUTONOMOUS_AGENT_PROMPT),
                 )
             ],
@@ -438,7 +440,7 @@ async def get_prompt(name: str, arguments: dict[str, Any] | None) -> GetPromptRe
         description = desc,
         messages    = [
             PromptMessage(
-                role    = "system",
+                role    = "user",
                 content = TextContent(type="text", text=text),
             )
         ],

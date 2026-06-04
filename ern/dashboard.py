@@ -1495,9 +1495,9 @@ function renderPromptsList(prompts) {
       <div style="display:flex; justify-content:space-between; align-items:center;">
         <div class="prompt-card-name">/ ${p.name}</div>
         <div style="display:flex; gap:6px;">
-          <button onclick="editPrompt(${JSON.stringify(p)})"
+          <button class="edit-btn"
             style="background:transparent; border:1px solid var(--g3); color:var(--g1); font-family:var(--font-mono); font-size:0.6rem; padding:2px 7px; border-radius:3px; cursor:pointer;">EDIT</button>
-          <button onclick="deletePrompt('${p.name}')"
+          <button class="del-btn"
             style="background:transparent; border:1px solid var(--red); color:var(--text-dim); font-family:var(--font-mono); font-size:0.6rem; padding:2px 7px; border-radius:3px; cursor:pointer;"
             onmouseover="this.style.color='var(--red)'" onmouseout="this.style.color='var(--text-dim)'">DEL</button>
         </div>
@@ -1505,6 +1505,8 @@ function renderPromptsList(prompts) {
       <div class="prompt-card-desc">${p.description || '(no description)'}</div>
       <div class="prompt-card-body">${p.text ? p.text.slice(0, 200) + (p.text.length > 200 ? '...' : '') : ''}</div>
     `;
+    card.querySelector('.edit-btn').onclick = () => editPrompt(p);
+    card.querySelector('.del-btn').onclick = () => deletePrompt(p.name);
     container.appendChild(card);
   });
 }

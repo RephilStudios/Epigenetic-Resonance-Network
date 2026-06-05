@@ -250,6 +250,17 @@ async def list_tools() -> list[Tool]:
 
 @server.call_tool()
 async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
+    try:
+        return await _dispatch_tool(name, arguments)
+    except Exception as exc:
+        import traceback
+        return [TextContent(type="text", text=json.dumps({
+            "error": str(exc),
+            "traceback": traceback.format_exc(limit=8),
+        }))]
+
+
+async def _dispatch_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
     async with httpx.AsyncClient(timeout=180.0) as client:
 
         if name == "get_moe_topology":
@@ -325,6 +336,11 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 f"{ERN_API_BASE}/api/recall/rollback/{chain_id}",
                 params={"module_id": module_id},
             )
+            body = r.text.strip()
+            if not body:
+                return [TextContent(type="text", text=json.dumps({
+                    "error": f"Empty response from rollback endpoint (HTTP {r.status_code})"
+                }))]
             return [TextContent(type="text", text=json.dumps(r.json(), indent=2))]
 
         elif name == "commit_recall_chain":
@@ -334,6 +350,11 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 f"{ERN_API_BASE}/api/recall/commit/{chain_id}",
                 params={"module_id": module_id},
             )
+            body = r.text.strip()
+            if not body:
+                return [TextContent(type="text", text=json.dumps({
+                    "error": f"Empty response from commit endpoint (HTTP {r.status_code})"
+                }))]
             return [TextContent(type="text", text=json.dumps(r.json(), indent=2))]
 
         else:

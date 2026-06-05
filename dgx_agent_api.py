@@ -751,7 +751,7 @@ def trigger_ltd_rollback(chain_id: str, module_id: Optional[str] = None):
         if chain_deltas:
             undone = mod.deltas.rollback_chain(mod, chain_id)
             total_undone += undone
-            modules_affected.append(mod.config["module_id"])
+            modules_affected.append(mod.module_id)
 
     if total_undone == 0:
         return {
@@ -796,7 +796,14 @@ def commit_recall_chain(chain_id: str, module_id: Optional[str] = None):
         if committed > 0:
             mod._save_state(debounce=False)
             total_committed += committed
-            modules_affected.append(mod.config["module_id"])
+            modules_affected.append(mod.module_id)
+
+    if total_committed == 0:
+        return {
+            "error"   : f"Chain '{chain_id}' not found in any active module's delta stack "
+                        "(already committed, rolled back, or never created).",
+            "status"  : "not_found",
+        }
 
     return {
         "status"          : "Chain committed. LTP boosts are now permanent.",

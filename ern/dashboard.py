@@ -26,6 +26,45 @@ HTML_TEMPLATE = r"""
   --text-dim:  #4a7a5a;
   --font-mono: 'Share Tech Mono', monospace;
   --font-hud:  'Orbitron', monospace;
+
+  /* Additional variables for theme flexibility */
+  --bg-gradient: repeating-linear-gradient(0deg, transparent, transparent 2px, rgba(0,255,136,0.015) 2px, rgba(0,255,136,0.015) 4px);
+  --scanline-color: rgba(0,0,0,0.06);
+  --glow-brand: 0 0 12px rgba(0,255,136,0.6);
+  --glow-bot: 0 0 8px rgba(0,255,136,0.5);
+  --glow-btn: 0 0 16px rgba(0,255,136,0.25);
+  --glow-btn-red: 0 0 14px rgba(255,58,58,0.25);
+  --glow-text-g0: 0 0 10px rgba(0,255,136,0.4);
+  --bg-cog: rgba(0, 0, 0, 0.4);
+  --bg-cog-header: rgba(0, 255, 136, 0.04);
+}
+
+body.light-theme {
+  --bg:        #f4f7fa;
+  --bg2:       #ffffff;
+  --bg3:       #e2ebf3;
+  --border:    #cbdce9;
+  --border2:   #dfebf5;
+  --g0:        #0066e6;
+  --g1:        #0052cc;
+  --g2:        #003d99;
+  --g3:        #a8caff;
+  --amber:     #ca8a04;
+  --red:       #dc2626;
+  --blue:      #0066e6;
+  --dim:       #85b3ff;
+  --text:      #0f1e36;
+  --text-dim:  #4a5d78;
+
+  --bg-gradient: repeating-linear-gradient(0deg, transparent, transparent 2px, rgba(0,102,230,0.008) 2px, rgba(0,102,230,0.008) 4px);
+  --scanline-color: rgba(0,0,0,0.02);
+  --glow-brand: 0 0 8px rgba(0,102,230,0.2);
+  --glow-bot: 0 0 6px rgba(0,102,230,0.15);
+  --glow-btn: 0 0 8px rgba(0,102,230,0.15);
+  --glow-btn-red: 0 0 8px rgba(220,38,38,0.15);
+  --glow-text-g0: 0 0 6px rgba(0,102,230,0.15);
+  --bg-cog: rgba(0, 0, 0, 0.04);
+  --bg-cog-header: rgba(0, 102, 230, 0.06);
 }
 
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -43,13 +82,12 @@ body {
   grid-template-areas:
     "topbar topbar"
     "chat   sidebar";
-  background-image:
-    repeating-linear-gradient(0deg, transparent, transparent 2px, rgba(0,255,136,0.015) 2px, rgba(0,255,136,0.015) 4px);
+  background-image: var(--bg-gradient);
 }
 
 body::before {
   content:''; position:fixed; inset:0; pointer-events:none; z-index:9999;
-  background: linear-gradient(transparent 50%, rgba(0,0,0,0.06) 50%);
+  background: linear-gradient(transparent 50%, var(--scanline-color) 50%);
   background-size: 100% 4px;
   animation: flicker 8s infinite;
 }
@@ -79,7 +117,7 @@ body::before {
 .brand {
   font-family: var(--font-hud); font-size: 0.8rem; font-weight: 900;
   color: var(--g0); letter-spacing: 0.15em; white-space: nowrap;
-  text-shadow: 0 0 12px rgba(0,255,136,0.6);
+  text-shadow: var(--glow-brand);
 }
 .brand span { color: var(--text-dim); font-weight:400; }
 
@@ -130,7 +168,7 @@ body::before {
 .msg.user::before { content: 'USR ▶'; display: block; font-family: var(--font-hud); font-size: 0.58rem; color: var(--g2); margin-bottom: 5px; letter-spacing: 0.1em; }
 
 .msg.bot { align-self: flex-start; background: var(--bg2); border: 1px solid var(--border); border-left: 3px solid var(--g2); color: var(--text); }
-.msg.bot::before { content: 'ERN ◀'; display: block; font-family: var(--font-hud); font-size: 0.58rem; color: var(--g1); margin-bottom: 5px; letter-spacing: 0.1em; text-shadow: 0 0 8px rgba(0,255,136,0.5); }
+.msg.bot::before { content: 'ERN ◀'; display: block; font-family: var(--font-hud); font-size: 0.58rem; color: var(--g1); margin-bottom: 5px; letter-spacing: 0.1em; text-shadow: var(--glow-bot); }
 .msg.bot.thinking { border-left-color: var(--amber); color: var(--text-dim); }
 .msg.bot.thinking::before { content: 'SYS ◀'; color: var(--amber); }
 
@@ -138,9 +176,9 @@ body::before {
 .thinking-dots::after { content: '...'; animation: dots 1.2s steps(4, end) infinite; }
 @keyframes dots { 0% { content: '.  '; } 33% { content: '.. '; } 66% { content: '...'; } 100%{ content: '.  '; } }
 
-.cognition-monitor { margin-top: 8px; background: rgba(0, 0, 0, 0.4); border: 1px solid var(--border2); border-left: 2px solid var(--g2); font-size: 0.72rem; font-family: var(--font-mono); }
-.cognition-header { padding: 6px 10px; background: rgba(0, 255, 136, 0.04); cursor: pointer; display: flex; justify-content: space-between; align-items: center; font-family: var(--font-hud); font-size: 0.6rem; letter-spacing: 0.08em; color: var(--g0); user-select: none; transition: background 0.15s; }
-.cognition-header:hover { background: rgba(0, 255, 136, 0.08); }
+.cognition-monitor { margin-top: 8px; background: var(--bg-cog); border: 1px solid var(--border2); border-left: 2px solid var(--g2); font-size: 0.72rem; font-family: var(--font-mono); }
+.cognition-header { padding: 6px 10px; background: var(--bg-cog-header); cursor: pointer; display: flex; justify-content: space-between; align-items: center; font-family: var(--font-hud); font-size: 0.6rem; letter-spacing: 0.08em; color: var(--g0); user-select: none; transition: background 0.15s; }
+.cognition-header:hover { background: var(--bg-cog-header); opacity: 0.8; }
 .cognition-header::after { content: '▼'; font-size: 0.55rem; transition: transform 0.2s; color: var(--g2); }
 .cognition-monitor.open .cognition-header::after { transform: rotate(-180deg); }
 .cognition-body { display: none; padding: 8px 12px; border-top: 1px solid var(--border2); animation: slide-down 0.2s ease-out; }
@@ -162,7 +200,7 @@ body::before {
 #userInput:focus { border-color: var(--g2); border-bottom-color: var(--g0); box-shadow: 0 0 0 1px rgba(0,255,136,0.1); }
 #userInput::placeholder { color: var(--text-dim); }
 #sendBtn { padding: 10px 20px; background: transparent; border: 1px solid var(--g2); color: var(--g0); font-family: var(--font-hud); font-size: 0.7rem; font-weight: 700; letter-spacing: 0.12em; cursor: pointer; transition: all 0.15s; position: relative; overflow: hidden; }
-#sendBtn:hover:not(:disabled) { background: var(--g3); border-color: var(--g0); box-shadow: 0 0 16px rgba(0,255,136,0.25); }
+#sendBtn:hover:not(:disabled) { background: var(--g3); border-color: var(--g0); box-shadow: var(--glow-btn); }
 #sendBtn:disabled { opacity: 0.3; cursor: not-allowed; }
 #sendBtn::after { content:''; position:absolute; inset:0; background: linear-gradient(90deg, transparent, rgba(0,255,136,0.15), transparent); transform: translateX(-100%); transition: transform 0.3s; }
 #sendBtn:hover:not(:disabled)::after { transform: translateX(100%); }
@@ -217,18 +255,18 @@ select option { background: var(--bg); }
 .de-op { font-family: var(--font-hud); font-size: 0.6rem; letter-spacing:0.08em; width: 52px; flex-shrink:0; padding-top:1px; }
 .ENCODE .de-op { color:var(--g0); } .DECAY  .de-op { color:var(--amber); } .BOOST  .de-op { color:var(--blue); } .SLEEP  .de-op { color:var(--red); } .RESTORE .de-op { color:#555; }
 .de-body { color: var(--text-dim); line-height:1.4; }
-.de-size { font-family:var(--font-hud); font-size:0.58rem; color:#3a5a4a; margin-left:auto; white-space:nowrap; }
+.de-size { font-family:var(--font-hud); font-size:0.58rem; color:var(--text-dim); margin-left:auto; white-space:nowrap; }
 
 #rollback-row { padding: 8px 10px; border-top: 1px solid var(--border); background: var(--bg3); display: flex; gap: 8px; align-items: center; }
 #rollback-row .ctrl-label { color: var(--text-dim); }
 #rollbackN { width: 48px; padding: 4px 6px; background: var(--bg); border: 1px solid var(--border); color: var(--g1); font-family: var(--font-mono); font-size: 0.8rem; text-align: center; outline: none; }
 #rollbackBtn { padding: 5px 12px; background: transparent; border: 1px solid var(--red); color: var(--red); font-family: var(--font-hud); font-size: 0.6rem; letter-spacing: 0.1em; cursor: pointer; transition: all 0.15s; }
-#rollbackBtn:hover { background: rgba(255,58,58,0.15); box-shadow: 0 0 10px rgba(255,58,58,0.3); }
+#rollbackBtn:hover { background: rgba(255,58,58,0.15); box-shadow: var(--glow-btn-red); }
 
 #statsGrid { flex:1; overflow-y:auto; padding:12px; display: grid; grid-template-columns: 1fr 1fr; gap: 10px; align-content: start; }
 .stat-card { background: var(--bg3); border: 1px solid var(--border); padding: 10px 12px; }
 .stat-card .sc-label { font-family: var(--font-hud); font-size: 0.56rem; letter-spacing: 0.1em; color: var(--text-dim); margin-bottom: 4px; }
-.stat-card .sc-val { font-family: var(--font-hud); font-size: 1.2rem; color: var(--g0); text-shadow: 0 0 10px rgba(0,255,136,0.4); }
+.stat-card .sc-val { font-family: var(--font-hud); font-size: 1.2rem; color: var(--g0); text-shadow: var(--glow-text-g0); }
 .stat-card.wide { grid-column: span 2; }
 .energy-bar-wrap { margin-top:8px; }
 .energy-bar-label { font-size:0.62rem; color:var(--text-dim); margin-bottom:3px; display:flex; justify-content:space-between; }
@@ -236,7 +274,7 @@ select option { background: var(--bg); }
 .energy-bar-fill { height:100%; background: linear-gradient(90deg, var(--g3), var(--g0)); transition: width 0.6s ease; }
 
 #sleepBtn { margin: 10px; padding: 8px; background: transparent; border: 1px solid var(--red); color: var(--red); font-family: var(--font-hud); font-size: 0.65rem; letter-spacing: 0.12em; cursor: pointer; width: calc(100% - 20px); transition: all 0.2s; }
-#sleepBtn:hover { background: rgba(255,58,58,0.1); box-shadow: 0 0 14px rgba(255,58,58,0.25); }
+#sleepBtn:hover { background: rgba(255,58,58,0.1); box-shadow: var(--glow-btn-red); }
 
 @media (max-width: 900px) {
   body { grid-template-columns: 1fr; grid-template-rows: auto 1fr 35dvh; grid-template-areas: "topbar" "chat" "sidebar"; }
@@ -283,7 +321,7 @@ select option { background: var(--bg); }
   color: var(--g0);
   border-bottom-color: var(--g0);
   background: rgba(0,255,136,0.04);
-  text-shadow: 0 0 8px rgba(0,255,136,0.4);
+  text-shadow: var(--glow-bot);
 }
 
 #moe-dashboard {
@@ -608,7 +646,7 @@ input:checked + .slider:before {
 .moe-builder-msg.user {
   background: rgba(0,204,255,0.1);
   border: 1px solid rgba(0,204,255,0.3);
-  color: #cceeff;
+  color: var(--text);
   align-self: flex-end;
 }
 .moe-builder-msg.bot {
@@ -685,6 +723,10 @@ input:checked + .slider:before {
 }
 .btn-create-expert-from-msg {
   transition: all 0.2s ease;
+}
+/* Smooth Theme Transitions */
+body, #topbar, #chat-area, #sidebar, #input-area, .msg, .memory-card, select, input, button, .tab, .main-tab, .moe-dash-header, .moe-dash-body, .moe-dash-left, .moe-dash-right, .moe-card, .prompt-card, .hud-pill, .cognition-monitor, .cognition-header, .moe-pipeline-widget, .moe-pipeline-strip, .architect-chat-standalone, .moe-builder-header, .moe-builder-input-area, .modal-content, .switch, .slider {
+  transition: background-color 0.3s ease, background 0.3s ease, color 0.3s ease, border-color 0.3s ease, box-shadow 0.3s ease, text-shadow 0.3s ease;
 }
 </style>
 </head>
@@ -805,6 +847,7 @@ input:checked + .slider:before {
   <div class="hud-pill live">VRAM LIVE</div>
   <div class="hud-pill">NODES: <span id="node-count">—</span></div>
   <div class="hud-pill">QUERIES: <span id="query-count-hud">0</span></div>
+  <div class="hud-pill" id="theme-btn" onclick="toggleTheme()" style="cursor:pointer; user-select:none; border-color:var(--g1); color:var(--g0);" title="Toggle visual theme mode">THEME: DARK</div>
 </div>
 
 <div id="chat-area">
@@ -1047,7 +1090,7 @@ function toggleAgenticSearch() {
     btn.textContent = 'ON';
     btn.style.borderColor = 'var(--g0)';
     btn.style.color = 'var(--g0)';
-    btn.style.textShadow = '0 0 6px var(--g0)';
+    btn.style.textShadow = 'var(--glow-text-g0)';
   } else {
     btn.textContent = 'OFF';
     btn.style.borderColor = 'var(--dim)';
@@ -1064,7 +1107,7 @@ function toggleTemporalDiscovery() {
     btn.textContent = 'ON';
     btn.style.borderColor = 'var(--g0)';
     btn.style.color = 'var(--g0)';
-    btn.style.textShadow = '0 0 6px var(--g0)';
+    btn.style.textShadow = 'var(--glow-text-g0)';
   } else {
     btn.textContent = 'OFF';
     btn.style.borderColor = 'var(--dim)';
@@ -2318,6 +2361,23 @@ async function submitModalCreateExpert() {
   } catch(e) {
     pushToast(`Failed to deploy expert: ${e.message}`, true);
   }
+}
+
+// ── Theme Manager ────────────────────────────────
+function toggleTheme() {
+  const isLight = document.body.classList.toggle('light-theme');
+  localStorage.setItem('theme', isLight ? 'light' : 'dark');
+  const btn = document.getElementById('theme-btn');
+  if (btn) btn.textContent = isLight ? 'THEME: LIGHT' : 'THEME: DARK';
+  pushToast(`Switched to ${isLight ? 'Light' : 'Dark'} Theme`);
+}
+
+// Initialise theme
+const savedTheme = localStorage.getItem('theme');
+if (savedTheme === 'light') {
+  document.body.classList.add('light-theme');
+  const btn = document.getElementById('theme-btn');
+  if (btn) btn.textContent = 'THEME: LIGHT';
 }
 
 loadModels();

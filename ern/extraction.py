@@ -3,6 +3,8 @@ import re
 import io
 import base64
 import requests
+import torch
+import torch.nn.functional as F
 from PIL import Image
 from pypdf import PdfReader
 from typing import Optional
@@ -10,6 +12,60 @@ from typing import Optional
 from ern.config import OLLAMA_URL, JUDGE_MODEL, VISION_MODEL, DEFAULT_MODEL
 from ern.module import manager
 from ern.helpers import _classify_message
+
+
+def route_fact_to_module(fact: str, tags: str, fallback_module_id: str = "default-memory") -> str:
+    """
+    After a fact is extracted, use cosine similarity against each module's
+    pre-computed description_vector to route it to the most semantically
+    appropriate non-frozen module.
+
+    Returns the winning module_id, or fallback_module_id if routing fails.
+    """
+    combined = f"{tags} {fact}"
+
+    # Collect all loaded, non-frozen modules that have a description_vector
+    candidates = []
+    for mid, mod in manager.active_modules.items():
+        if mod.frozen:
+            continue
+        if not hasattr(mod, "description_vector"):
+            continue
+        candidates.append((mid, mod))
+
+    # Also ensure any module in the registry is loaded so we can compare it
+    for mid, config in manager.registry["modules"].items():
+        if config.get("frozen", False):
+            continue
+        if mid not in manager.active_modules:
+            mod = manager.get_module(mid)
+            if mod and hasattr(mod, "description_vector"):
+                candidates.append((mid, mod))
+
+    if not candidates:
+        print(f"[MOE ROUTER] No routable modules found — using fallback '{fallback_module_id}'.")
+        return fallback_module_id
+
+    # Use the first available module's embedder (shared across all modules)
+    embedder = candidates[0][1].embedder
+    device   = candidates[0][1].device
+
+    with torch.no_grad():
+        fact_vec = embedder.encode(combined, convert_to_tensor=True, device=device)
+        fact_vec = F.normalize(fact_vec, p=2, dim=0)
+
+    best_mid   = fallback_module_id
+    best_score = -1.0
+
+    for mid, mod in candidates:
+        score = F.cosine_similarity(fact_vec.unsqueeze(0), mod.description_vector.unsqueeze(0)).item()
+        print(f"[MOE ROUTER] Module '{mod.name}' ({mid}): score={score:.4f}")
+        if score > best_score:
+            best_score = score
+            best_mid   = mid
+
+    print(f"[MOE ROUTER] ✓ Routed fact to '{best_mid}' (score={best_score:.4f})")
+    return best_mid
 
 def run_memory_judge(user_message: str, prior_memories: str = "", target_module_id: str = "default-memory"):
     print(f"\n[MEMORY JUDGE] Starting — target: '{target_module_id}' — message: '{user_message[:80]}'")
@@ -91,12 +147,17 @@ def run_memory_judge(user_message: str, prior_memories: str = "", target_module_
                 tags = inferred_tags
             if not fact or len(fact) < 5:
                 continue
-            print(f"[MEMORY JUDGE] Saving fact to '{target_mod.name}': {fact[:100]} | type: {memory_type}")
-            target_mod.encode_hebbian(text=fact, tags=tags, memory_type=memory_type)
+
+            # ── MoE Routing: pick the best module for this specific fact ──────
+            routed_mid = route_fact_to_module(fact, tags, fallback_module_id=target_module_id)
+            routed_mod = manager.get_module(routed_mid) or target_mod
+
+            print(f"[MEMORY JUDGE] Saving fact to '{routed_mod.name}': {fact[:100]} | type: {memory_type}")
+            routed_mod.encode_hebbian(text=fact, tags=tags, memory_type=memory_type)
             saved_count += 1
 
         if saved_count > 0:
-            print(f"[MEMORY JUDGE] ✓ Saved {saved_count} fact(s) to '{target_mod.name}'.")
+            print(f"[MEMORY JUDGE] ✓ Saved {saved_count} fact(s) across MoE modules.")
         else:
             # FALLBACK: LLM returned garbage we couldn't parse — save the raw message
             print(f"[MEMORY JUDGE] Parser found 0 facts from LLM output. Saving raw message as fallback.")

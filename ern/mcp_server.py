@@ -45,7 +45,8 @@ from mcp.types import (
 from starlette.applications import Starlette
 from starlette.responses import Response
 from starlette.routing import Route, Mount
-# No monkey-patching needed as we use standard "user" role compliant with the MCP spec.
+
+from ern.extraction import route_fact_to_module
 
 
 # ---------------------------------------------------------------------------
@@ -142,9 +143,10 @@ async def list_tools() -> list[Tool]:
             inputSchema = {
                 "type": "object",
                 "properties": {
-                    "query"    : {"type": "string",  "description": "Search query text"},
-                    "module_id": {"type": "string",  "description": "Target module ID from get_moe_topology (default: 'default-memory')"},
-                    "top_k"   : {"type": "integer",  "description": "Max results to return (default: 5)"},
+                    "query"            : {"type": "string",  "description": "Search query text"},
+                    "module_id"        : {"type": "string",  "description": "Target module ID from get_moe_topology (default: 'default-memory')"},
+                    "top_k"            : {"type": "integer",  "description": "Max results to return (default: 5)"},
+                    "memory_type_filter": {"type": "string",  "description": "Filter by type: 'fact', 'question', or 'instruction'. Omit for all types."},
                 },
                 "required": ["query"],
             },
@@ -289,16 +291,14 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any]) -> list[TextConte
             }, indent=2))]
 
         elif name == "query_ern_memory":
-            # Fix #10: use /api/memory/query for proper cosine-similarity semantic search
-            # (the old /api/memories endpoint only did substring text matching)
-            r = await client.get(
-                f"{ERN_API_BASE}/api/memory/query",
-                params={
-                    "q"        : arguments["query"],
-                    "module_id": arguments.get("module_id", "default-memory"),
-                    "top_k"    : arguments.get("top_k", 5),
-                },
-            )
+            params = {
+                "q"        : arguments["query"],
+                "module_id": arguments.get("module_id", "default-memory"),
+                "top_k"    : arguments.get("top_k", 5),
+            }
+            if "memory_type_filter" in arguments and arguments["memory_type_filter"]:
+                params["memory_type_filter"] = arguments["memory_type_filter"]
+            r = await client.get(f"{ERN_API_BASE}/api/memory/query", params=params)
             memories = r.json().get("memories", [])
             return [TextContent(type="text", text=json.dumps(memories, indent=2))]
 
@@ -315,10 +315,21 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any]) -> list[TextConte
             return [TextContent(type="text", text=json.dumps(r.json(), indent=2))]
 
         elif name == "store_memory":
+            text      = arguments["text"]
+            tags      = arguments.get("tags", "")
+            module_id = arguments.get("module_id", "default-memory")
+
+            # Auto-route if the agent didn't specify a module (or fell back to default)
+            if not module_id or module_id == "default-memory":
+                module_id = route_fact_to_module(text, tags, fallback_module_id="default-memory")
+                print(f"[MCP STORE] MoE router selected '{module_id}' for: {text[:80]}")
+            else:
+                print(f"[MCP STORE] Agent explicitly routed to '{module_id}': {text[:80]}")
+
             r = await client.post(
                 f"{ERN_API_BASE}/api/memory/store",
-                params={"module_id": arguments.get("module_id", "default-memory")},
-                json={"text": arguments["text"], "tags": arguments.get("tags", "")},
+                params={"module_id": module_id},
+                json={"text": text, "tags": tags},
             )
             return [TextContent(type="text", text=json.dumps(r.json(), indent=2))]
 

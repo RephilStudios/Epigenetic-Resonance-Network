@@ -35,7 +35,7 @@ from ern.helpers import (
 from ern.routing import route_query_to_modules, agentic_search_planner
 from ern.deep_recall import deep_recall
 from ern.extraction import (
-    run_memory_judge, extract_text_from_pdf, run_pdf_extractor_chunk,
+    run_memory_judge, route_fact_to_module, extract_text_from_pdf, run_pdf_extractor_chunk,
     process_pdf_background, process_image_background
 )
 from ern.dashboard import HTML_TEMPLATE
@@ -301,32 +301,16 @@ def process_chat(req: ChatRequest, background_tasks: BackgroundTasks):
     except Exception as e:
         return ChatResponse(reply=f"Ollama Error: {e}", context_used=context_block, memories=unique_memories, agentic_steps=agentic_steps)
 
-    target_extraction_id = "default-memory"  # Always guaranteed fallback
+    # Passive ingestion — classify type, MoE-route, then save
+    # Questions, facts, and instructions each carry different initial energy levels
+    # so the network naturally differentiates signal quality without extra logic.
+    msg_tags, _ = _classify_message(user_message)
+    target_extraction_id = route_fact_to_module(user_message, msg_tags, fallback_module_id="default-memory")
 
-    # 1. Highest priority: explicit active expert from sidepanel (not auto-route, not default-memory)
-    if req.active_expert and req.active_expert not in ("default-memory", "auto-route") and req.active_expert in manager.registry["modules"]:
-        mod = manager.get_module(req.active_expert)
-        if mod and not mod.frozen:
-            target_extraction_id = req.active_expert
-            print(f"[MEMORY JUDGE TARGET] Pinned to active expert: {target_extraction_id}")
-
-    # 2. Otherwise scan pipeline for first mutable non-default module
-    elif not req.active_expert or req.active_expert in ("default-memory", "auto-route"):
-        for pid in pipeline_ids:
-            if pid == "default-memory":
-                continue
-            mod = manager.get_module(pid)
-            if mod and not mod.frozen:
-                target_extraction_id = pid
-                print(f"[MEMORY JUDGE TARGET] Resolved from pipeline: {target_extraction_id}")
-                break
-
-    print(f"[MEMORY] Saving to module: '{target_extraction_id}'")
-
-    # Direct synchronous save — no LLM judge, no background task, guaranteed every time
+    # Synchronous raw save — type-tagged, guaranteed every turn
     _direct_save_message(user_message, target_extraction_id)
 
-    # Also run LLM-based fact extraction in background as a bonus enhancement
+    # LLM-based extraction in background — each extracted fact gets its own MoE routing
     background_tasks.add_task(run_memory_judge, user_message, context_block, target_extraction_id)
 
     return ChatResponse(reply=bot_reply, context_used=context_block, memories=unique_memories, agentic_steps=agentic_steps)
